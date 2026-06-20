@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.tmp
+pool_history.json
+addr_history.json
+*.bak.*

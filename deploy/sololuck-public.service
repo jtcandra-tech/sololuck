@@ -1,0 +1,14 @@
+[Unit]
+Description=SoloLuck public solo-pool stats page
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=SOLOLUCK_STRATUM_HOST=your.pool.host
+Environment=SOLOLUCK_CKPOOL_STATS_URL=http://127.0.0.1:8888/api/stats
+ExecStart=/usr/bin/python3 /opt/sololuck/server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+# Minimal reverse proxy for the SoloLuck public page.
+# server.py listens on 127.0.0.1:8201; terminate TLS here.
+server {
+    listen 443 ssl;
+    server_name your.domain;
+
+    # ssl_certificate / ssl_certificate_key ...
+
+    gzip on;
+    gzip_types text/html application/json image/svg+xml text/css application/javascript;
+    gzip_min_length 256;
+    gzip_vary on;
+
+    location = /health { return 404; }   # keep the internal healthcheck off the public surface
+    location / {
+        proxy_pass http://127.0.0.1:8201;
+        proxy_set_header Host $host;
+    }
+}
