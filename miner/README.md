@@ -41,12 +41,14 @@ Two options:
 
 ## Ports (difficulty tiers)
 The port only sets your *starting* difficulty; vardiff tunes it automatically.
-- `3333` — Lite (default; right for a CPU)
+- `3335` — **Nano (default)** — difficulty 1, tuned for CPUs so your shares register fast
+- `3333` — Lite (Bitaxe / small ASICs)
 - `8081` — Standard
 - `4334` — Pro
 - `3334` — TLS / SSL (encrypted; needs a TLS-capable miner)
 
-For CPU mining, **stick with 3333**.
+For CPU mining, **stick with 3335 (Nano)** — at the higher tiers a CPU can take days to
+submit a single share, so it'd never show up.
 
 ---
 

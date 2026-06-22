@@ -25,7 +25,7 @@ from tkinter import messagebox, ttk
 
 APP_NAME = "SoloLuck Miner"
 DEFAULT_HOST = "sololuck.io"
-DEFAULT_PORT = "3333"
+DEFAULT_PORT = "3335"   # Nano tier — diff 1, tuned for CPUs so shares register fast
 ALGO = "sha256d"   # Bitcoin
 # cpuminer-opt executable names we recognise, in the app's own folder.
 MINER_NAMES = [
