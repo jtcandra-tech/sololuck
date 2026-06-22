@@ -218,6 +218,81 @@ def select_engine():
     return None
 
 
+def _engine_stage_base():
+    """A STABLE, writable folder to copy the engine into (so its path doesn't change
+    every launch like the PyInstaller temp dir, and the user can add ONE antivirus
+    exclusion that sticks). Tries next-to-the-exe first, then LOCALAPPDATA, then TEMP."""
+    cands = [app_dir(),
+             os.environ.get("LOCALAPPDATA", ""),
+             os.environ.get("TEMP", "")]
+    for base in cands:
+        if not base:
+            continue
+        d = os.path.join(base, "SoloLuckMiner-engine")
+        try:
+            os.makedirs(d, exist_ok=True)
+            t = os.path.join(d, ".wtest")
+            with open(t, "w"):
+                pass
+            os.remove(t)
+            return d
+        except Exception:
+            continue
+    return None
+
+
+def stage_engine():
+    """Resolve the engine to run. For the frozen .exe, copy the selected build + its
+    runtime DLLs out of the volatile _MEIPASS temp dir into a stable folder and run
+    from THERE — and prefer a copy that's already staged, so once the user excludes
+    that folder in their antivirus it keeps working even if AV re-quarantines the
+    temp copy on every launch. Falls back to running in place if staging isn't
+    possible. Returns a path or None."""
+    if not getattr(sys, "frozen", False):
+        return select_engine()  # dev/script mode: run in place
+    base = _engine_stage_base()
+    if not base:
+        return select_engine()
+    # 1) a preferred build already staged (survives AV quarantine of the temp copy)
+    for n in _engine_candidates():
+        p = os.path.join(base, n)
+        if os.path.isfile(p):
+            return p
+    # 2) copy the selected build + all DLLs out of the bundle
+    src = select_engine()
+    if not src:
+        return None
+    try:
+        import shutil
+        srcdir = os.path.dirname(src)
+        names = [os.path.basename(src)] + [f for f in os.listdir(srcdir) if f.lower().endswith(".dll")]
+        for name in names:
+            d = os.path.join(base, name)
+            if not os.path.isfile(d):
+                shutil.copy2(os.path.join(srcdir, name), d)
+        dest = os.path.join(base, os.path.basename(src))
+        return dest if os.path.isfile(dest) else src
+    except Exception:
+        return src  # last resort: run straight from _MEIPASS
+
+
+def _engine_missing_msg():
+    """Actionable message for when the engine can't be launched — almost always an
+    antivirus false-positive that quarantined the bundled cpuminer engine."""
+    folder = _engine_stage_base() or app_dir()
+    return ("The mining engine isn't available when it's time to start.\n\n"
+            "This almost always means your antivirus or Windows Defender quarantined it. "
+            "EVERY CPU miner trips this false-positive — it's the bundled cpuminer-opt "
+            "engine, not this app, and it does nothing but hash.\n\n"
+            "Fix it once:\n"
+            "  1. Open Windows Security  →  Virus & threat protection.\n"
+            "  2. Under \"Protection history\", Allow / Restore any SoloLuck or cpuminer item.\n"
+            "  3. Add an Exclusion (Folder) for:\n"
+            "       %s\n"
+            "  4. Reopen SoloLuck Miner and click Start Mining.\n\n"
+            "Advanced: you can instead drop your own cpuminer-opt.exe next to this app." % folder)
+
+
 def find_miner():
     """A USER-SUPPLIED cpuminer-opt build dropped in the app folder (overrides the
     bundled engine). Returns its path, or None."""
@@ -369,25 +444,17 @@ class MinerApp:
             self.engine_path = over
             self.q.put(("__ENG__", os.path.basename(over), "your own build"))
             return
-        # 2) reuse the cached choice if it still matches this CPU and exists
-        sig = cpu_signature()
-        if self._cfg_engine and self._cfg_sig == sig:
-            p = os.path.join(engine_dir(), self._cfg_engine)
-            if os.path.isfile(p):
-                self.engine_path = p
-                self.q.put(("__ENG__", self._cfg_engine, "bundled"))
-                return
-        # 3) detect + probe to pick the fastest compatible bundled build
-        self.q.put(("__ENGMSG__", "Engine: picking the fastest build for your CPU…"))
-        p = select_engine()
-        if p:
+        # 2) detect the best build and stage it to a stable, AV-excludable folder
+        self.q.put(("__ENGMSG__", "Engine: preparing the best build for your CPU…"))
+        p = stage_engine()
+        if p and os.path.isfile(p):
             self.engine_path = p
             self._cfg_engine = os.path.basename(p)
-            self._cfg_sig = sig
+            self._cfg_sig = cpu_signature()
             self.q.put(("__ENG__", self._cfg_engine, "bundled, auto-selected"))
             self.q.put(("__SAVECFG__", None))
         else:
-            self.q.put(("__ENGMSG__", "Engine: none bundled — drop a cpuminer-opt.exe next to this app"))
+            self.q.put(("__ENGMSG__", "Engine: blocked by antivirus? You'll get steps when you press Start."))
 
     def _tier_from_name(self, name):
         n = name.lower()
@@ -450,14 +517,10 @@ class MinerApp:
             messagebox.showerror(APP_NAME, "Port must be a number (e.g. 3335).")
             return
         # the bundled engine is normally resolved at launch; if selection is still
-        # running (or this is a dev run with no engine), resolve it now.
-        miner = self.engine_path or find_miner() or select_engine()
-        if not miner:
-            messagebox.showerror(APP_NAME,
-                "Couldn't find the mining engine.\n\nThe cpuminer-opt engine ships inside "
-                "this app, so this usually means the download was incomplete — reinstall "
-                "SoloLuckMiner.exe. (Advanced: you can also drop your own cpuminer-opt.exe "
-                "next to this app.)")
+        # running (or this is a dev run), resolve/stage it now.
+        miner = self.engine_path or find_miner() or stage_engine()
+        if not miner or not os.path.isfile(miner):
+            messagebox.showerror(APP_NAME, _engine_missing_msg())
             return
         self.engine_path = miner
 
@@ -488,6 +551,12 @@ class MinerApp:
                 stdin=subprocess.DEVNULL, text=True, bufsize=1,
                 universal_newlines=True, creationflags=creationflags,
                 cwd=app_dir())
+        except FileNotFoundError:
+            # the engine vanished between selection and launch — almost always AV
+            self.proc = None
+            self.engine_path = None
+            messagebox.showerror(APP_NAME, _engine_missing_msg())
+            return
         except Exception as e:
             self.proc = None
             messagebox.showerror(APP_NAME, "Couldn't launch the miner:\n%s" % e)
@@ -571,8 +640,8 @@ class MinerApp:
                 self.start()
 
     def _reselect_and_restart(self):
-        p = select_engine()
-        if p:
+        p = stage_engine()
+        if p and os.path.isfile(p):
             self.engine_path = p
             self._cfg_engine = os.path.basename(p)
             self._cfg_sig = cpu_signature()
@@ -664,9 +733,72 @@ def _selftest():
         pass
 
 
+def _minetest(seconds, addr, threads):
+    """Headless end-to-end test: resolve the bundled engine and actually mine to the
+    live pool for `seconds`, exactly like the Start button. Writes the engine output
+    + a PASS/FAIL to a file beside the .exe. Usage:
+    SoloLuckMiner.exe --minetest <seconds> <btc-address> [threads]"""
+    out = os.path.join(app_dir(), "sololuck_minetest.txt")
+    log = []
+    def w(s):
+        log.append(str(s))
+    eng = stage_engine()   # same path the Start button uses (stages out of _MEIPASS)
+    w("engine: %s" % eng)
+    if not eng:
+        w("RESULT: FAIL (no engine)")
+        open(out, "w").write("\n".join(log) + "\n"); return
+    url = "stratum+tcp://%s:%s" % (DEFAULT_HOST, DEFAULT_PORT)
+    user = "%s.%s" % (addr, "bundletest")
+    cmd = [eng, "-a", ALGO, "-o", url, "-u", user, "-p", "x", "-t", str(threads)]
+    w("cmd: %s" % " ".join(cmd))
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
+    captured = []
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, bufsize=1, creationflags=flags)
+    except Exception as e:
+        w("launch error: %r" % e); w("RESULT: FAIL")
+        open(out, "w").write("\n".join(log) + "\n"); return
+    end = time.time() + seconds
+    rdr = threading.Thread(target=lambda: [captured.append(l.rstrip()) for l in p.stdout], daemon=True)
+    rdr.start()
+    while time.time() < end and p.poll() is None:
+        time.sleep(0.5)
+    try:
+        p.terminate(); p.wait(timeout=5)
+    except Exception:
+        try: p.kill()
+        except Exception: pass
+    blob = "\n".join(captured)
+    low = blob.lower()
+    connected = ("stratum" in low and ("connect" in low or "subscrib" in low or "authoriz" in low or "difficulty" in low))
+    gotwork = "new work" in low or "new job" in low or "stratum requested work restart" in low
+    hashing = "h/s" in low or "khash" in low or "hash rate" in low
+    accepted = "accepted" in low or "yes!" in low
+    w("--- engine output (last 30 lines) ---")
+    for ln in captured[-30:]:
+        w("  " + ln)
+    w("--- signals: connected=%s gotwork=%s hashing=%s accepted=%s" % (connected, gotwork, hashing, accepted))
+    ok = connected and (gotwork or hashing)
+    w("RESULT: %s" % ("PASS — mining live to the pool" + (" (share accepted!)" if accepted else "")
+                      if ok else "FAIL — did not establish mining"))
+    try:
+        open(out, "w").write("\n".join(log) + "\n")
+    except Exception:
+        pass
+
+
 def main():
     if "--selftest" in sys.argv:
         _selftest()
+        return
+    if "--minetest" in sys.argv:
+        i = sys.argv.index("--minetest")
+        rest = sys.argv[i + 1:]
+        secs = int(rest[0]) if len(rest) > 0 and rest[0].isdigit() else 90
+        addr = rest[1] if len(rest) > 1 else ""
+        thr = int(rest[2]) if len(rest) > 2 and rest[2].isdigit() else 2
+        _minetest(secs, addr, thr)
         return
     root = tk.Tk()
     try:

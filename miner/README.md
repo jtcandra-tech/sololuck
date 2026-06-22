@@ -55,10 +55,20 @@ To just run the source: `python sololuck_miner.py` after `powershell -ExecutionP
 
 ---
 
+## Antivirus / Windows Defender (important)
+**Every CPU miner trips antivirus false-positives** — it's the bundled cpuminer-opt engine
+(it only hashes), not this GUI. If Defender quarantines it you'll see a clear in-app message;
+if mining won't start:
+1. Windows Security → **Virus & threat protection**.
+2. **Protection history** → **Allow / Restore** any "SoloLuck" or "cpuminer" item.
+3. Add an **Exclusion (Folder)** for the `SoloLuckMiner-engine` folder next to the app
+   (the app tells you the exact path).
+4. Reopen the app and click **Start Mining**.
+
+The app extracts the engine to that stable folder on purpose, so a single exclusion sticks.
+
 ## Notes
 - A PC's hashrate is tiny vs ASICs — treat this as a lottery ticket, fitting for a solo pool.
-- **Antivirus may flag any miner as a false positive** — that's expected for mining software
-  (it's the bundled cpuminer-opt engine, not this GUI). You may need to allow it.
 - This app is pure Python standard library (tkinter) — it has no network code of its own; it
   only launches cpuminer-opt and reads its output. Your address never leaves your machine
   except as the stratum login to the pool you choose.
