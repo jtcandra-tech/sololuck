@@ -280,10 +280,10 @@ def _engine_missing_msg():
     """Actionable message for when the engine can't be launched — almost always an
     antivirus false-positive that quarantined the bundled cpuminer engine."""
     folder = _engine_stage_base() or app_dir()
-    return ("The mining engine isn't available when it's time to start.\n\n"
-            "This almost always means your antivirus or Windows Defender quarantined it. "
-            "EVERY CPU miner trips this false-positive — it's the bundled cpuminer-opt "
-            "engine, not this app, and it does nothing but hash.\n\n"
+    return ("The mining engine was blocked or removed by your antivirus.\n\n"
+            "Windows Defender either quarantined it (WinError 2) or blocked it outright as "
+            "a virus/PUA (WinError 225). EVERY CPU miner trips this false-positive — it's the "
+            "bundled cpuminer-opt engine, not this app, and it does nothing but hash.\n\n"
             "Fix it once:\n"
             "  1. Open Windows Security  →  Virus & threat protection.\n"
             "  2. Under \"Protection history\", Allow / Restore any SoloLuck or cpuminer item.\n"
@@ -551,11 +551,15 @@ class MinerApp:
                 stdin=subprocess.DEVNULL, text=True, bufsize=1,
                 universal_newlines=True, creationflags=creationflags,
                 cwd=app_dir())
-        except FileNotFoundError:
-            # the engine vanished between selection and launch — almost always AV
+        except OSError as e:
+            # WinError 2 = engine missing (quarantined); 225 = blocked outright as a
+            # virus/PUA; 226 = blocked, comment. All are antivirus interference.
             self.proc = None
             self.engine_path = None
-            messagebox.showerror(APP_NAME, _engine_missing_msg())
+            if isinstance(e, FileNotFoundError) or getattr(e, "winerror", None) in (2, 225, 226):
+                messagebox.showerror(APP_NAME, _engine_missing_msg())
+            else:
+                messagebox.showerror(APP_NAME, "Couldn't launch the miner:\n%s" % e)
             return
         except Exception as e:
             self.proc = None
