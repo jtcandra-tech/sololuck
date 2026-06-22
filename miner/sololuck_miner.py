@@ -7,11 +7,17 @@ A PC's hashrate is tiny next to an ASIC, so this is a lottery ticket — which i
 exactly the point of a solo pool. If your CPU happens to solve a block, the whole
 reward is paid straight to your address on-chain (minus the pool's flat 2% fee).
 
-Setup: keep a cpuminer-opt build named cpuminer-opt.exe (or cpuminer-avx2.exe /
-cpuminer-zen3.exe / etc.) in the SAME folder as this app — it auto-detects common
-names. Then fill in your BTC address and click Start Mining.
+The cpuminer-opt engine is BUNDLED inside this app — there is nothing to download.
+On first launch the app detects your CPU and automatically picks the fastest
+compatible cpuminer-opt build (AVX-512 / AVX2 / SHA / SSE4.2 / SSE2), falling back
+safely if a faster build isn't supported. Advanced users can still drop their own
+cpuminer build (e.g. cpuminer-opt.exe / cpuminer-zen4.exe) next to this app and it
+will be used instead.
 
-Pure standard-library (tkinter + subprocess) — no third-party Python deps.
+cpuminer-opt is GPLv2 software by Jay D Dee — source: https://github.com/JayDDee/cpuminer-opt
+(its licence ships alongside the bundled engine). This GUI is pure Python standard
+library (tkinter + subprocess) — no third-party Python deps, and no network code of
+its own; it only launches cpuminer-opt and reads its output.
 """
 import json
 import os
@@ -20,6 +26,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -27,7 +34,9 @@ APP_NAME = "SoloLuck Miner"
 DEFAULT_HOST = "sololuck.io"
 DEFAULT_PORT = "3335"   # Nano tier — diff 1, tuned for CPUs so shares register fast
 ALGO = "sha256d"   # Bitcoin
-# cpuminer-opt executable names we recognise, in the app's own folder.
+ENGINE_SUBDIR = "engine"   # where the bundled cpuminer-opt builds live
+# cpuminer-opt executable names we recognise as a USER-SUPPLIED override in the
+# app's own folder (takes priority over the bundled engine).
 MINER_NAMES = [
     "cpuminer-opt.exe", "cpuminer.exe",
     "cpuminer-avx2.exe", "cpuminer-avx512.exe", "cpuminer-avx.exe",
@@ -58,20 +67,172 @@ def app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def engine_dir():
+    """Folder holding the BUNDLED cpuminer-opt builds. For a PyInstaller --onefile
+    .exe the engines are unpacked under sys._MEIPASS/engine; when run as a script
+    they sit in ./engine next to the source. Falls back to the app folder."""
+    base = getattr(sys, "_MEIPASS", None) or app_dir()
+    d = os.path.join(base, ENGINE_SUBDIR)
+    if os.path.isdir(d):
+        return d
+    d2 = os.path.join(app_dir(), ENGINE_SUBDIR)
+    return d2 if os.path.isdir(d2) else app_dir()
+
+
 CFG_PATH = os.path.join(app_dir(), "sololuck_miner.cfg")
 
 
+# Windows PF_* ids for kernel32!IsProcessorFeaturePresent (native, no deps).
+_PF = {"SSE42": 38, "AVX": 39, "AVX2": 40, "AVX512F": 41}
+
+
+def _has(feat):
+    """True if the running CPU/OS reports the given instruction-set feature."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.kernel32.IsProcessorFeaturePresent(_PF[feat]))
+    except Exception:
+        return False
+
+
+def _cpuid(leaf, subleaf=0):
+    """Run the x86-64 CPUID instruction via a tiny ctypes shellcode stub and return
+    (eax, ebx, ecx, edx). Windows 64-bit only; raises on anything else."""
+    if os.name != "nt":
+        raise OSError("cpuid: Windows only")
+    import ctypes
+    if ctypes.sizeof(ctypes.c_void_p) != 8:
+        raise OSError("cpuid: 64-bit only")
+    # Windows x64 ABI: leaf->ecx, subleaf->edx, out ptr->r8.
+    code = bytes((
+        0x53,                    # push rbx
+        0x4D, 0x89, 0xC1,        # mov r9, r8      ; r9 = out ptr
+        0x89, 0xC8,              # mov eax, ecx    ; eax = leaf
+        0x89, 0xD1,              # mov ecx, edx    ; ecx = subleaf
+        0x0F, 0xA2,              # cpuid
+        0x41, 0x89, 0x01,        # mov [r9],    eax
+        0x41, 0x89, 0x59, 0x04,  # mov [r9+4],  ebx
+        0x41, 0x89, 0x49, 0x08,  # mov [r9+8],  ecx
+        0x41, 0x89, 0x51, 0x0C,  # mov [r9+12], edx
+        0x5B,                    # pop rbx
+        0xC3,                    # ret
+    ))
+    k = ctypes.windll.kernel32
+    k.VirtualAlloc.restype = ctypes.c_void_p
+    k.VirtualAlloc.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.c_ulong)
+    addr = k.VirtualAlloc(None, len(code), 0x3000, 0x40)  # MEM_COMMIT|RESERVE, EXECUTE_READWRITE
+    if not addr:
+        raise OSError("cpuid: VirtualAlloc failed")
+    try:
+        ctypes.memmove(addr, code, len(code))
+        out = (ctypes.c_uint32 * 4)()
+        proto = ctypes.CFUNCTYPE(None, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p)
+        proto(addr)(leaf, subleaf, ctypes.cast(out, ctypes.c_void_p))
+        return (out[0], out[1], out[2], out[3])
+    finally:
+        k.VirtualFree.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong)
+        k.VirtualFree(addr, 0, 0x8000)  # MEM_RELEASE
+
+
+def cpu_features():
+    """Detect the instruction sets that decide which cpuminer-opt build to run.
+    AVX-family flags come from the OS (IsProcessorFeaturePresent — it also confirms
+    the OS will actually preserve those registers); AES / SHA-NI / VAES come from
+    CPUID (the OS API has no flag for them). Everything fails safe to False."""
+    f = {"AVX512F": _has("AVX512F"), "AVX2": _has("AVX2"),
+         "AVX": _has("AVX"), "SSE42": _has("SSE42"),
+         "AES": False, "SHA": False, "VAES": False}
+    try:
+        _, _, ecx1, _ = _cpuid(1)
+        _, ebx7, ecx7, _ = _cpuid(7, 0)
+        f["AES"] = bool(ecx1 & (1 << 25))
+        f["SHA"] = bool(ebx7 & (1 << 29))
+        f["VAES"] = bool(ecx7 & (1 << 9))
+        # corroborate the OS-reported flags if CPUID is available
+        if not f["SSE42"]:
+            f["SSE42"] = bool(ecx1 & (1 << 20))
+    except Exception:
+        pass
+    return f
+
+
+def cpu_signature():
+    """A fingerprint of the CPU so a portable .exe re-selects its engine if copied
+    to a different machine."""
+    import platform
+    fe = cpu_features()
+    flags = "".join("1" if fe[k] else "0" for k in
+                    ("AVX512F", "AVX2", "AVX", "SSE42", "AES", "SHA", "VAES"))
+    try:
+        brand = platform.processor() or ""
+    except Exception:
+        brand = ""
+    return flags + "|" + brand
+
+
+def _engine_candidates():
+    """Bundled cpuminer-opt build names, best→safest for THIS CPU. Selection is fully
+    deterministic from detected features (no launch probing) and always ends at the
+    universal sse2 build, so a present file is always found."""
+    f = cpu_features()
+    c = []
+    if f["AVX512F"]:
+        if f["SHA"] and f["VAES"]:
+            c.append("cpuminer-avx512-sha-vaes.exe")
+        c.append("cpuminer-avx512.exe")
+    if f["AVX2"]:
+        if f["SHA"] and f["VAES"]:
+            c.append("cpuminer-avx2-sha-vaes.exe")
+        if f["SHA"]:
+            c.append("cpuminer-avx2-sha.exe")
+        c.append("cpuminer-avx2.exe")
+    if f["SSE42"] and f["AES"]:
+        c.append("cpuminer-aes-sse42.exe")
+    c.append("cpuminer-sse2.exe")
+    seen, out = set(), []
+    for x in c:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def select_engine():
+    """Pick the best bundled cpuminer-opt build present for this CPU. Deterministic,
+    offline. Returns a path, or None if no bundled engine is present."""
+    d = engine_dir()
+    for n in _engine_candidates():
+        p = os.path.join(d, n)
+        if os.path.isfile(p):
+            return p
+    # nothing matched (unexpected) — fall back to any bundled cpuminer build
+    try:
+        for fn in sorted(os.listdir(d)):
+            low = fn.lower()
+            if low.startswith("cpuminer") and low.endswith(".exe"):
+                return os.path.join(d, fn)
+    except OSError:
+        pass
+    return None
+
+
 def find_miner():
-    """Return the path to a recognised cpuminer-opt build in the app folder, or None."""
+    """A USER-SUPPLIED cpuminer-opt build dropped in the app folder (overrides the
+    bundled engine). Returns its path, or None."""
     d = app_dir()
     for name in MINER_NAMES:
         p = os.path.join(d, name)
         if os.path.isfile(p):
             return p
-    # last resort: any file that looks like a cpuminer build
+    # last resort: any file that looks like a cpuminer build, but never the
+    # bundled engine subfolder
     try:
         for f in os.listdir(d):
             low = f.lower()
+            if low == ENGINE_SUBDIR:
+                continue
             if low.startswith("cpuminer") and (low.endswith(".exe") or "." not in low):
                 return os.path.join(d, f)
     except OSError:
@@ -88,13 +249,21 @@ class MinerApp:
         self.accepted = 0
         self.rejected = 0
         self.hashrate = "—"
+        self.engine_path = None          # resolved cpuminer build to run
+        self._cfg_engine = ""            # cached engine basename (from cfg)
+        self._cfg_sig = ""               # cached CPU signature (from cfg)
+        self._start_ts = 0               # last miner launch time (crash guard)
+        self._saw_hash = False           # did the current run ever report a hashrate
+        self._auto_retry = False         # one auto re-select after a fast crash
         root.title(APP_NAME)
         root.configure(bg=BG)
-        root.minsize(560, 560)
+        root.minsize(560, 580)
         self._build_ui()
         self._load_cfg()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(200, self._pump)
+        # resolve the bundled engine in the background so the UI stays responsive
+        threading.Thread(target=self._init_engine, daemon=True).start()
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -162,8 +331,12 @@ class MinerApp:
         self.acc_lbl = stat(1, "ACCEPTED")
         self.rej_lbl = stat(2, "REJECTED")
 
+        self.engine_lbl = tk.Label(self.root, text="Engine: detecting your CPU…",
+                                    fg=MUTED, bg=BG, font=("Segoe UI", 8))
+        self.engine_lbl.pack(anchor="w", padx=18, pady=(2, 0))
+
         logf = tk.Frame(self.root, bg=BG)
-        logf.pack(fill="both", expand=True, padx=14, pady=(8, 14))
+        logf.pack(fill="both", expand=True, padx=14, pady=(6, 14))
         tk.Label(logf, text="Miner log", fg=MUTED, bg=BG,
                  font=("Segoe UI", 9)).pack(anchor="w")
         self.log = tk.Text(logf, bg="#080b10", fg=MUTED, relief="flat", wrap="word",
@@ -188,6 +361,48 @@ class MinerApp:
             self.log.delete("1.0", "200.0")
         self.log.configure(state="disabled")
 
+    # ---------- engine resolution (runs off the UI thread) ----------
+    def _init_engine(self):
+        # 1) a user-supplied build in the app folder always wins
+        over = find_miner()
+        if over:
+            self.engine_path = over
+            self.q.put(("__ENG__", os.path.basename(over), "your own build"))
+            return
+        # 2) reuse the cached choice if it still matches this CPU and exists
+        sig = cpu_signature()
+        if self._cfg_engine and self._cfg_sig == sig:
+            p = os.path.join(engine_dir(), self._cfg_engine)
+            if os.path.isfile(p):
+                self.engine_path = p
+                self.q.put(("__ENG__", self._cfg_engine, "bundled"))
+                return
+        # 3) detect + probe to pick the fastest compatible bundled build
+        self.q.put(("__ENGMSG__", "Engine: picking the fastest build for your CPU…"))
+        p = select_engine()
+        if p:
+            self.engine_path = p
+            self._cfg_engine = os.path.basename(p)
+            self._cfg_sig = sig
+            self.q.put(("__ENG__", self._cfg_engine, "bundled, auto-selected"))
+            self.q.put(("__SAVECFG__", None))
+        else:
+            self.q.put(("__ENGMSG__", "Engine: none bundled — drop a cpuminer-opt.exe next to this app"))
+
+    def _tier_from_name(self, name):
+        n = name.lower()
+        if "avx512" in n:
+            return "AVX-512"
+        if "avx2-sha" in n:
+            return "AVX2 + SHA"
+        if "avx2" in n:
+            return "AVX2"
+        if "aes-sse42" in n or "sse42" in n:
+            return "SSE4.2 + AES"
+        if "sse2" in n:
+            return "SSE2 (baseline)"
+        return ""
+
     # ---------- config ----------
     def _load_cfg(self):
         try:
@@ -198,6 +413,8 @@ class MinerApp:
             self.host_var.set(c.get("host", DEFAULT_HOST))
             self.port_var.set(c.get("port", DEFAULT_PORT))
             self.threads_var.set(c.get("threads", ""))
+            self._cfg_engine = c.get("engine", "")
+            self._cfg_sig = c.get("engine_sig", "")
         except Exception:
             pass
 
@@ -208,7 +425,9 @@ class MinerApp:
                            "worker": self.worker_var.get().strip(),
                            "host": self.host_var.get().strip(),
                            "port": self.port_var.get().strip(),
-                           "threads": self.threads_var.get().strip()}, f)
+                           "threads": self.threads_var.get().strip(),
+                           "engine": self._cfg_engine,
+                           "engine_sig": self._cfg_sig}, f)
         except Exception:
             pass
 
@@ -228,16 +447,19 @@ class MinerApp:
                 "block reward paid to (e.g. bc1q…). In solo mode the address IS your login.")
             return
         if not port.isdigit():
-            messagebox.showerror(APP_NAME, "Port must be a number (e.g. 3333).")
+            messagebox.showerror(APP_NAME, "Port must be a number (e.g. 3335).")
             return
-        miner = find_miner()
+        # the bundled engine is normally resolved at launch; if selection is still
+        # running (or this is a dev run with no engine), resolve it now.
+        miner = self.engine_path or find_miner() or select_engine()
         if not miner:
             messagebox.showerror(APP_NAME,
-                "Couldn't find a cpuminer-opt build.\n\nDownload one from\n"
-                "https://github.com/JayDDee/cpuminer-opt/releases\n\n"
-                "and put it in the SAME folder as this app (e.g. cpuminer-opt.exe "
-                "or cpuminer-avx2.exe).")
+                "Couldn't find the mining engine.\n\nThe cpuminer-opt engine ships inside "
+                "this app, so this usually means the download was incomplete — reinstall "
+                "SoloLuckMiner.exe. (Advanced: you can also drop your own cpuminer-opt.exe "
+                "next to this app.)")
             return
+        self.engine_path = miner
 
         user = ("%s.%s" % (addr, worker)) if worker else addr
         url = "stratum+tcp://%s:%s" % (host, port)
@@ -250,6 +472,8 @@ class MinerApp:
         self.acc_lbl.config(text="0")
         self.rej_lbl.config(text="0")
         self.hr_lbl.config(text="…")
+        self._saw_hash = False
+        self._start_ts = time.time()
         self._save_cfg()
         self._logln("$ %s -a %s -o %s -u %s -p x%s"
                     % (os.path.basename(miner), ALGO, url, user,
@@ -306,15 +530,55 @@ class MinerApp:
         try:
             while True:
                 item = self.q.get_nowait()
-                if isinstance(item, tuple) and item and item[0] == "__EXIT__":
-                    if self.proc is not None:
-                        self._logln("— miner exited (code %s) —" % item[1], RED)
-                        self.stop(user=False)
+                if isinstance(item, tuple) and item:
+                    self._handle_event(item)
                     continue
                 self._handle_line(item)
         except queue.Empty:
             pass
         self.root.after(200, self._pump)
+
+    def _handle_event(self, item):
+        kind = item[0]
+        if kind == "__EXIT__":
+            if self.proc is not None:
+                code = item[1]
+                crashed_fast = (time.time() - self._start_ts) < 6 and not self._saw_hash
+                self._logln("— miner exited (code %s) —" % code, RED)
+                self.stop(user=False)
+                # a fast crash with no output usually means the cached build doesn't
+                # run on this CPU (e.g. the .exe was copied here) — reselect once.
+                if crashed_fast and not self._auto_retry and not find_miner():
+                    self._auto_retry = True
+                    self._logln("Re-detecting a compatible engine and retrying…", ORANGE)
+                    self._cfg_engine = ""
+                    self.engine_path = None
+                    threading.Thread(target=self._reselect_and_restart, daemon=True).start()
+        elif kind == "__ENG__":
+            name, why = item[1], item[2]
+            tier = self._tier_from_name(name)
+            self.engine_lbl.config(
+                text="Engine: %s%s · %s" % (name, (" (" + tier + ")") if tier else "", why))
+            self._logln("Engine ready: %s%s [%s]"
+                        % (name, (" — " + tier) if tier else "", why), MUTED)
+        elif kind == "__ENGMSG__":
+            self.engine_lbl.config(text=item[1])
+        elif kind == "__SAVECFG__":
+            self._save_cfg()
+        elif kind == "__RESTART__":
+            # re-enter mining on the UI thread after a successful engine re-select
+            if not self.proc:
+                self.start()
+
+    def _reselect_and_restart(self):
+        p = select_engine()
+        if p:
+            self.engine_path = p
+            self._cfg_engine = os.path.basename(p)
+            self._cfg_sig = cpu_signature()
+            self.q.put(("__ENG__", self._cfg_engine, "bundled, re-selected"))
+            self.q.put(("__SAVECFG__", None))
+            self.q.put(("__RESTART__", None))
 
     def _handle_line(self, line):
         low = line.lower()
@@ -345,6 +609,7 @@ class MinerApp:
         if "h/s" in low and not low.lstrip("[0123456789:.\\- ]").startswith("cpu #"):
             hm = HASH_RE.search(line)
             if hm:
+                self._saw_hash = True
                 self.hashrate = "%s %sH/s" % (hm.group(1), hm.group(2) or "")
                 self.hr_lbl.config(text=self.hashrate)
 
@@ -355,7 +620,54 @@ class MinerApp:
         self.root.destroy()
 
 
+def _selftest():
+    """Headless build-validation: resolve the bundled engine and run it with -V to
+    confirm it launches (i.e. its bundled DLLs load) on this CPU. Writes the result
+    to a file beside the .exe and exits. Triggered by `SoloLuckMiner.exe --selftest`;
+    since the app is built --noconsole there is no stdout to read."""
+    out = os.path.join(app_dir(), "sololuck_selftest.txt")
+    lines = []
+    def w(s):
+        lines.append(str(s))
+    try:
+        w("engine_dir: %s" % engine_dir())
+        w("features: %s" % cpu_features())
+        w("signature: %s" % cpu_signature())
+        eng = select_engine()
+        w("selected: %s" % eng)
+        if not eng:
+            w("RESULT: FAIL (no bundled engine found)")
+        else:
+            d = os.path.dirname(eng)
+            w("engine_files: %s" % sorted(os.listdir(d)))
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
+            try:
+                r = subprocess.run([eng, "-V"], stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, timeout=20,
+                                   creationflags=flags, text=True)
+                w("engine -V exit: %s" % r.returncode)
+                w("engine -V output (first 5 lines):")
+                for ln in (r.stdout or "").splitlines()[:5]:
+                    w("  " + ln)
+                ok = r.returncode == 0 and "cpuminer" in (r.stdout or "").lower()
+                w("RESULT: %s" % ("PASS — engine launches, DLLs load" if ok else "FAIL — engine did not run cleanly"))
+            except Exception as e:
+                w("engine launch error: %r" % e)
+                w("RESULT: FAIL (engine could not be launched — missing DLL?)")
+    except Exception as e:
+        w("selftest error: %r" % e)
+        w("RESULT: FAIL")
+    try:
+        with open(out, "w") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+
+
 def main():
+    if "--selftest" in sys.argv:
+        _selftest()
+        return
     root = tk.Tk()
     try:
         root.tk.call("tk", "scaling", 1.2)

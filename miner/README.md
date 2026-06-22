@@ -10,32 +10,21 @@ with live hashrate and share counts.
 
 ---
 
-## Setup (3 steps)
+## Use it (2 steps)
 
-### 1. Get the engine
-Download cpuminer-opt for Windows (v25.5+):
-https://github.com/JayDDee/cpuminer-opt/releases
+The cpuminer-opt engine is **bundled inside the app** — there's nothing to download and
+nothing to configure. On first launch the app detects your CPU and automatically picks
+the fastest compatible engine build (AVX-512 / AVX2 / SHA / SSE4.2 / SSE2).
 
-Pick the build for your CPU:
-- **Most modern CPUs:** `cpuminer-avx2.exe`
-- **AMD Ryzen 5000 / 7000:** `cpuminer-zen3.exe` / `cpuminer-zen4.exe`
-- **Very old CPU:** `cpuminer-sse2.exe`
+### 1. Run it
+Grab **`SoloLuckMiner.exe`** from https://sololuck.io and run it. (No install.)
 
-Rename it to `cpuminer-opt.exe` (or leave the name — the app auto-detects common names).
-
-### 2. Run the app
-Two options:
-- **Quick:** `python sololuck_miner.py`  (needs Python 3 — tkinter ships with it on Windows)
-- **Build an .exe:** double-click `build.bat`, then run `dist\SoloLuckMiner.exe`
-
-**Keep `cpuminer-opt.exe` in the SAME folder as the app.**
-
-### 3. Fill in and Start
+### 2. Fill in and Start
 - **BTC payout address** — where the block reward goes (your wallet). In solo mode the
   address *is* your login.
 - **Worker name** — anything (e.g. `pc`).
-- **Pool host** `sololuck.io`, **Port** = your stratum port.
-- Click **Start Mining**.
+- **Pool host** `sololuck.io`, **Port** stays on `3335` (Nano) for CPUs.
+- Click **Start Mining**. The selected engine shows under the stats.
 
 ---
 
@@ -52,14 +41,30 @@ submit a single share, so it'd never show up.
 
 ---
 
+## Build it yourself (optional)
+The repo ships *without* binaries to stay lean. `build.bat` fetches the engine and bundles it:
+
+1. Install Python 3 (tkinter ships with it on Windows).
+2. Double-click **`build.bat`** — it runs `fetch-engine.ps1` to download the latest
+   cpuminer-opt Windows builds into `.\engine\`, then PyInstaller embeds them into a single
+   `dist\SoloLuckMiner.exe`.
+
+To just run the source: `python sololuck_miner.py` after `powershell -ExecutionPolicy Bypass
+-File fetch-engine.ps1` (so `.\engine\` exists). Advanced users can instead drop their own
+`cpuminer-opt.exe` next to the app — it overrides the bundled engine.
+
+---
+
 ## Notes
 - A PC's hashrate is tiny vs ASICs — treat this as a lottery ticket, fitting for a solo pool.
-- The default port `3333` is correct for almost everyone.
 - **Antivirus may flag any miner as a false positive** — that's expected for mining software
-  (it's the bundled `cpuminer-opt.exe`, not this GUI). You may need to allow it.
+  (it's the bundled cpuminer-opt engine, not this GUI). You may need to allow it.
 - This app is pure Python standard library (tkinter) — it has no network code of its own; it
-  only launches `cpuminer-opt` and reads its output. Your address never leaves your machine
+  only launches cpuminer-opt and reads its output. Your address never leaves your machine
   except as the stratum login to the pool you choose.
-- Open-source. Mine to any ckpool-style pool by changing the host/port.
+- The bundled **cpuminer-opt** engine is GPLv2 software by Jay D Dee —
+  source: https://github.com/JayDDee/cpuminer-opt (its licence ships in the app's `engine`
+  folder as `cpuminer-opt-LICENSE.txt`). This GUI is open-source; mine to any ckpool-style
+  pool by changing the host/port.
 
 Website: https://sololuck.io · Channel: https://t.me/SoloLuckPool
