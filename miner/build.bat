@@ -1,11 +1,11 @@
 @echo off
-setlocal enabledelayedexpansion
-REM Build SoloLuckMiner.exe from sololuck_miner.py using PyInstaller, with the
-REM cpuminer-opt engine builds BUNDLED inside the .exe (nothing to download).
-REM Requires Python 3 on PATH. Produces dist\SoloLuckMiner.exe (a GUI app, no console).
+REM Build SoloLuckMiner.exe from sololuck_miner.py using PyInstaller.
+REM This is a CLEAN wrapper — no engine is bundled; the app downloads the
+REM cpuminer-opt engine itself on first run. Requires Python 3 on PATH.
+REM Produces dist\SoloLuckMiner.exe (a small GUI app, no console).
 
 echo ============================================
-echo   Building SoloLuck Miner...
+echo   Building SoloLuck Miner (clean wrapper)...
 echo ============================================
 
 python -m pip install --upgrade pyinstaller
@@ -16,34 +16,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-REM 1) make sure the engine builds are present (download them if not)
-if not exist "engine\cpuminer-sse2.exe" (
-  echo.
-  echo Fetching the cpuminer-opt engine builds...
-  powershell -NoProfile -ExecutionPolicy Bypass -File fetch-engine.ps1
-  if errorlevel 1 (
-    echo.
-    echo Failed to fetch the cpuminer-opt engine. Check your internet connection,
-    echo or place the cpuminer-*.exe builds in an .\engine\ folder manually.
-    pause
-    exit /b 1
-  )
-)
-
-REM 2) collect every engine build into PyInstaller --add-binary args
-set ADDBIN=
-for %%f in (engine\cpuminer-*.exe) do set ADDBIN=!ADDBIN! --add-binary "%%f;engine"
-REM cpuminer-opt is NOT static — bundle its runtime DLLs alongside the engines
-for %%f in (engine\*.dll) do set ADDBIN=!ADDBIN! --add-binary "%%f;engine"
-if exist "engine\cpuminer-opt-LICENSE.txt" set ADDBIN=!ADDBIN! --add-data "engine\cpuminer-opt-LICENSE.txt;engine"
-if exist "engine\cpuminer-opt-README.txt" set ADDBIN=!ADDBIN! --add-data "engine\cpuminer-opt-README.txt;engine"
-if exist "engine\ENGINE-SOURCE.txt" set ADDBIN=!ADDBIN! --add-data "engine\ENGINE-SOURCE.txt;engine"
-
-echo.
-echo Bundling engine builds:
-for %%f in (engine\cpuminer-*.exe) do echo    %%~nxf
-
-python -m PyInstaller --onefile --noconsole --clean --name SoloLuckMiner !ADDBIN! sololuck_miner.py
+python -m PyInstaller --onefile --noconsole --clean --name SoloLuckMiner sololuck_miner.py
 if errorlevel 1 (
   echo.
   echo Build failed.
@@ -55,7 +28,8 @@ echo.
 echo ============================================
 echo   Done. Your app is at:  dist\SoloLuckMiner.exe
 echo.
-echo   The cpuminer-opt engine is bundled inside it — just run it,
-echo   paste your BTC address, and click Start Mining.
+echo   Just run it — it downloads the matching cpuminer-opt
+echo   engine on first launch, then you paste your BTC address
+echo   and click Start Mining.
 echo ============================================
 pause

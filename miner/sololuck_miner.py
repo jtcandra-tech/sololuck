@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """
-SoloLuck Miner — a simple Start/Stop GUI that wraps the cpuminer-opt CPU engine
+SoloLuck Miner — a simple Start/Stop GUI that drives the cpuminer-opt CPU engine
 and points it at the SoloLuck solo Bitcoin pool (sololuck.io).
 
 A PC's hashrate is tiny next to an ASIC, so this is a lottery ticket — which is
 exactly the point of a solo pool. If your CPU happens to solve a block, the whole
 reward is paid straight to your address on-chain (minus the pool's flat 2% fee).
 
-The cpuminer-opt engine is BUNDLED inside this app — there is nothing to download.
-On first launch the app detects your CPU and automatically picks the fastest
-compatible cpuminer-opt build (AVX-512 / AVX2 / SHA / SSE4.2 / SSE2), falling back
-safely if a faster build isn't supported. Advanced users can still drop their own
-cpuminer build (e.g. cpuminer-opt.exe / cpuminer-zen4.exe) next to this app and it
-will be used instead.
+This is a CLEAN WRAPPER: it contains no mining code itself. On first run it detects
+your CPU and DOWNLOADS the matching cpuminer-opt build (Jay D Dee's, GPLv2) from
+GitHub into a folder next to the app, then runs it. Nothing to install. (Advanced
+users can drop their own cpuminer-opt.exe next to this app to skip the download.)
 
-cpuminer-opt is GPLv2 software by Jay D Dee — source: https://github.com/JayDDee/cpuminer-opt
-(its licence ships alongside the bundled engine). This GUI is pure Python standard
-library (tkinter + subprocess) — no third-party Python deps, and no network code of
-its own; it only launches cpuminer-opt and reads its output.
+Why a clean wrapper: a GUI with no embedded miner isn't itself flagged as a coin
+miner, so the app always launches; antivirus only ever flags the downloaded engine,
+which you whitelist once. Pure Python standard library (tkinter + urllib).
 """
+import io
 import json
 import os
 import queue
@@ -27,6 +25,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
+import zipfile
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -34,16 +34,18 @@ APP_NAME = "SoloLuck Miner"
 DEFAULT_HOST = "sololuck.io"
 DEFAULT_PORT = "3335"   # Nano tier — diff 1, tuned for CPUs so shares register fast
 ALGO = "sha256d"   # Bitcoin
-ENGINE_SUBDIR = "engine"   # where the bundled cpuminer-opt builds live
-# cpuminer-opt executable names we recognise as a USER-SUPPLIED override in the
-# app's own folder (takes priority over the bundled engine).
+ENGINE_DIR_NAME = "SoloLuckMiner-engine"
+GITHUB_RELEASE_API = "https://api.github.com/repos/JayDDee/cpuminer-opt/releases/latest"
+# cpuminer-opt isn't statically linked — these ride next to whichever build we use.
+ENGINE_DLLS = ["libcurl-4.dll", "libgcc_s_seh-1.dll", "libstdc++-6.dll",
+               "libwinpthread-1.dll", "zlib1.dll"]
+# user-supplied override builds we recognise in the app folder.
 MINER_NAMES = [
     "cpuminer-opt.exe", "cpuminer.exe",
     "cpuminer-avx2.exe", "cpuminer-avx512.exe", "cpuminer-avx.exe",
     "cpuminer-zen.exe", "cpuminer-zen3.exe", "cpuminer-zen4.exe", "cpuminer-zen5.exe",
     "cpuminer-sse2.exe", "cpuminer-sse42.exe", "cpuminer-aes-sse42.exe",
-    # non-Windows (dev / Linux) fallbacks
-    "cpuminer-opt", "cpuminer",
+    "cpuminer-opt", "cpuminer",   # non-Windows dev fallbacks
 ]
 ADDR_RE = re.compile(r"^(bc1[a-z0-9]{20,90}|[13][a-km-zA-HJ-NP-Z1-9]{20,40})$")
 HASH_RE = re.compile(r"([\d.]+)\s*([kKMGTP]?)[hH]/s")
@@ -67,22 +69,10 @@ def app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def engine_dir():
-    """Folder holding the BUNDLED cpuminer-opt builds. For a PyInstaller --onefile
-    .exe the engines are unpacked under sys._MEIPASS/engine; when run as a script
-    they sit in ./engine next to the source. Falls back to the app folder."""
-    base = getattr(sys, "_MEIPASS", None) or app_dir()
-    d = os.path.join(base, ENGINE_SUBDIR)
-    if os.path.isdir(d):
-        return d
-    d2 = os.path.join(app_dir(), ENGINE_SUBDIR)
-    return d2 if os.path.isdir(d2) else app_dir()
-
-
 CFG_PATH = os.path.join(app_dir(), "sololuck_miner.cfg")
 
 
-# Windows PF_* ids for kernel32!IsProcessorFeaturePresent (native, no deps).
+# ── CPU feature detection (decides which cpuminer-opt build to fetch) ──────────
 _PF = {"SSE42": 38, "AVX": 39, "AVX2": 40, "AVX512F": 41}
 
 
@@ -98,31 +88,21 @@ def _has(feat):
 
 
 def _cpuid(leaf, subleaf=0):
-    """Run the x86-64 CPUID instruction via a tiny ctypes shellcode stub and return
-    (eax, ebx, ecx, edx). Windows 64-bit only; raises on anything else."""
+    """x86-64 CPUID via a tiny ctypes shellcode stub → (eax,ebx,ecx,edx). Win64 only."""
     if os.name != "nt":
         raise OSError("cpuid: Windows only")
     import ctypes
     if ctypes.sizeof(ctypes.c_void_p) != 8:
         raise OSError("cpuid: 64-bit only")
-    # Windows x64 ABI: leaf->ecx, subleaf->edx, out ptr->r8.
     code = bytes((
-        0x53,                    # push rbx
-        0x4D, 0x89, 0xC1,        # mov r9, r8      ; r9 = out ptr
-        0x89, 0xC8,              # mov eax, ecx    ; eax = leaf
-        0x89, 0xD1,              # mov ecx, edx    ; ecx = subleaf
-        0x0F, 0xA2,              # cpuid
-        0x41, 0x89, 0x01,        # mov [r9],    eax
-        0x41, 0x89, 0x59, 0x04,  # mov [r9+4],  ebx
-        0x41, 0x89, 0x49, 0x08,  # mov [r9+8],  ecx
-        0x41, 0x89, 0x51, 0x0C,  # mov [r9+12], edx
-        0x5B,                    # pop rbx
-        0xC3,                    # ret
+        0x53, 0x4D, 0x89, 0xC1, 0x89, 0xC8, 0x89, 0xD1, 0x0F, 0xA2,
+        0x41, 0x89, 0x01, 0x41, 0x89, 0x59, 0x04, 0x41, 0x89, 0x49, 0x08,
+        0x41, 0x89, 0x51, 0x0C, 0x5B, 0xC3,
     ))
     k = ctypes.windll.kernel32
     k.VirtualAlloc.restype = ctypes.c_void_p
     k.VirtualAlloc.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.c_ulong)
-    addr = k.VirtualAlloc(None, len(code), 0x3000, 0x40)  # MEM_COMMIT|RESERVE, EXECUTE_READWRITE
+    addr = k.VirtualAlloc(None, len(code), 0x3000, 0x40)
     if not addr:
         raise OSError("cpuid: VirtualAlloc failed")
     try:
@@ -133,14 +113,11 @@ def _cpuid(leaf, subleaf=0):
         return (out[0], out[1], out[2], out[3])
     finally:
         k.VirtualFree.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong)
-        k.VirtualFree(addr, 0, 0x8000)  # MEM_RELEASE
+        k.VirtualFree(addr, 0, 0x8000)
 
 
 def cpu_features():
-    """Detect the instruction sets that decide which cpuminer-opt build to run.
-    AVX-family flags come from the OS (IsProcessorFeaturePresent — it also confirms
-    the OS will actually preserve those registers); AES / SHA-NI / VAES come from
-    CPUID (the OS API has no flag for them). Everything fails safe to False."""
+    """AVX-family from the OS; AES/SHA-NI/VAES from CPUID. Fails safe to False."""
     f = {"AVX512F": _has("AVX512F"), "AVX2": _has("AVX2"),
          "AVX": _has("AVX"), "SSE42": _has("SSE42"),
          "AES": False, "SHA": False, "VAES": False}
@@ -150,7 +127,6 @@ def cpu_features():
         f["AES"] = bool(ecx1 & (1 << 25))
         f["SHA"] = bool(ebx7 & (1 << 29))
         f["VAES"] = bool(ecx7 & (1 << 9))
-        # corroborate the OS-reported flags if CPUID is available
         if not f["SSE42"]:
             f["SSE42"] = bool(ecx1 & (1 << 20))
     except Exception:
@@ -159,8 +135,6 @@ def cpu_features():
 
 
 def cpu_signature():
-    """A fingerprint of the CPU so a portable .exe re-selects its engine if copied
-    to a different machine."""
     import platform
     fe = cpu_features()
     flags = "".join("1" if fe[k] else "0" for k in
@@ -172,10 +146,8 @@ def cpu_signature():
     return flags + "|" + brand
 
 
-def _engine_candidates():
-    """Bundled cpuminer-opt build names, best→safest for THIS CPU. Selection is fully
-    deterministic from detected features (no launch probing) and always ends at the
-    universal sse2 build, so a present file is always found."""
+def preferred_builds():
+    """cpuminer-opt build names best→safest for THIS CPU; ends at the universal sse2."""
     f = cpu_features()
     c = []
     if f["AVX512F"]:
@@ -199,36 +171,14 @@ def _engine_candidates():
     return out
 
 
-def select_engine():
-    """Pick the best bundled cpuminer-opt build present for this CPU. Deterministic,
-    offline. Returns a path, or None if no bundled engine is present."""
-    d = engine_dir()
-    for n in _engine_candidates():
-        p = os.path.join(d, n)
-        if os.path.isfile(p):
-            return p
-    # nothing matched (unexpected) — fall back to any bundled cpuminer build
-    try:
-        for fn in sorted(os.listdir(d)):
-            low = fn.lower()
-            if low.startswith("cpuminer") and low.endswith(".exe"):
-                return os.path.join(d, fn)
-    except OSError:
-        pass
-    return None
-
-
-def _engine_stage_base():
-    """A STABLE, writable folder to copy the engine into (so its path doesn't change
-    every launch like the PyInstaller temp dir, and the user can add ONE antivirus
-    exclusion that sticks). Tries next-to-the-exe first, then LOCALAPPDATA, then TEMP."""
-    cands = [app_dir(),
-             os.environ.get("LOCALAPPDATA", ""),
-             os.environ.get("TEMP", "")]
-    for base in cands:
+# ── engine location (a stable, antivirus-excludable folder next to the app) ───
+def engine_dir():
+    """A stable, writable folder to keep the downloaded engine in (so the path
+    doesn't change and the user can add ONE antivirus exclusion that sticks)."""
+    for base in (app_dir(), os.environ.get("LOCALAPPDATA", ""), os.environ.get("TEMP", "")):
         if not base:
             continue
-        d = os.path.join(base, "SoloLuckMiner-engine")
+        d = os.path.join(base, ENGINE_DIR_NAME)
         try:
             os.makedirs(d, exist_ok=True)
             t = os.path.join(d, ".wtest")
@@ -238,81 +188,115 @@ def _engine_stage_base():
             return d
         except Exception:
             continue
-    return None
+    return os.path.join(app_dir(), ENGINE_DIR_NAME)
 
 
-def stage_engine():
-    """Resolve the engine to run. For the frozen .exe, copy the selected build + its
-    runtime DLLs out of the volatile _MEIPASS temp dir into a stable folder and run
-    from THERE — and prefer a copy that's already staged, so once the user excludes
-    that folder in their antivirus it keeps working even if AV re-quarantines the
-    temp copy on every launch. Falls back to running in place if staging isn't
-    possible. Returns a path or None."""
-    if not getattr(sys, "frozen", False):
-        return select_engine()  # dev/script mode: run in place
-    base = _engine_stage_base()
-    if not base:
-        return select_engine()
-    # 1) a preferred build already staged (survives AV quarantine of the temp copy)
-    for n in _engine_candidates():
-        p = os.path.join(base, n)
-        if os.path.isfile(p):
-            return p
-    # 2) copy the selected build + all DLLs out of the bundle
-    src = select_engine()
-    if not src:
-        return None
-    try:
-        import shutil
-        srcdir = os.path.dirname(src)
-        names = [os.path.basename(src)] + [f for f in os.listdir(srcdir) if f.lower().endswith(".dll")]
-        for name in names:
-            d = os.path.join(base, name)
-            if not os.path.isfile(d):
-                shutil.copy2(os.path.join(srcdir, name), d)
-        dest = os.path.join(base, os.path.basename(src))
-        return dest if os.path.isfile(dest) else src
-    except Exception:
-        return src  # last resort: run straight from _MEIPASS
-
-
-def _engine_missing_msg():
-    """Actionable message for when the engine can't be launched — almost always an
-    antivirus false-positive that quarantined the bundled cpuminer engine."""
-    folder = _engine_stage_base() or app_dir()
-    return ("The mining engine was blocked or removed by your antivirus.\n\n"
-            "Windows Defender either quarantined it (WinError 2) or blocked it outright as "
-            "a virus/PUA (WinError 225). EVERY CPU miner trips this false-positive — it's the "
-            "bundled cpuminer-opt engine, not this app, and it does nothing but hash.\n\n"
-            "Fix it once:\n"
-            "  1. Open Windows Security  →  Virus & threat protection.\n"
-            "  2. Under \"Protection history\", Allow / Restore any SoloLuck or cpuminer item.\n"
-            "  3. Add an Exclusion (Folder) for:\n"
-            "       %s\n"
-            "  4. Reopen SoloLuck Miner and click Start Mining.\n\n"
-            "Advanced: you can instead drop your own cpuminer-opt.exe next to this app." % folder)
-
-
-def find_miner():
-    """A USER-SUPPLIED cpuminer-opt build dropped in the app folder (overrides the
-    bundled engine). Returns its path, or None."""
+def find_user_miner():
+    """A user-supplied cpuminer build dropped in the app folder (skips the download)."""
     d = app_dir()
     for name in MINER_NAMES:
         p = os.path.join(d, name)
         if os.path.isfile(p):
             return p
-    # last resort: any file that looks like a cpuminer build, but never the
-    # bundled engine subfolder
     try:
         for f in os.listdir(d):
             low = f.lower()
-            if low == ENGINE_SUBDIR:
+            if low == ENGINE_DIR_NAME.lower():
                 continue
             if low.startswith("cpuminer") and (low.endswith(".exe") or "." not in low):
                 return os.path.join(d, f)
     except OSError:
         pass
     return None
+
+
+def find_local_engine():
+    """The best already-downloaded build in the engine folder, or None."""
+    d = engine_dir()
+    for b in preferred_builds():
+        p = os.path.join(d, b)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _http_get(url, want_json=False, timeout=180):
+    req = urllib.request.Request(url, headers={"User-Agent": "SoloLuckMiner",
+                                               "Accept": "application/octet-stream" if not want_json
+                                               else "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = r.read()
+    return json.loads(data.decode("utf-8")) if want_json else data
+
+
+def _latest_engine_zip_url():
+    rel = _http_get(GITHUB_RELEASE_API, want_json=True, timeout=60)
+    assets = rel.get("assets", []) or []
+    for a in assets:
+        n = (a.get("name") or "").lower()
+        if n.endswith(".zip") and ("windows" in n or "win64" in n):
+            return a.get("browser_download_url")
+    for a in assets:
+        if (a.get("name") or "").lower().endswith(".zip"):
+            return a.get("browser_download_url")
+    raise RuntimeError("No Windows engine archive on the latest cpuminer-opt release.")
+
+
+def download_engine(report=lambda s: None):
+    """Fetch the cpuminer-opt Windows archive from GitHub and extract the build that
+    fits this CPU (+ sse2 fallback + runtime DLLs) into the engine folder. Returns a
+    runnable engine path. Raises on network/extract/AV failure."""
+    dest = engine_dir()
+    report("Finding the latest mining engine…")
+    url = _latest_engine_zip_url()
+    report("Downloading the mining engine (~18 MB, one time)…")
+    blob = _http_get(url, timeout=300)
+    report("Unpacking…")
+    zf = zipfile.ZipFile(io.BytesIO(blob))
+    members = {os.path.basename(n): n for n in zf.namelist() if not n.endswith("/")}
+    wanted = []
+    for b in preferred_builds():
+        if b in members:
+            wanted.append(b)
+            break
+    if "cpuminer-sse2.exe" in members and "cpuminer-sse2.exe" not in wanted:
+        wanted.append("cpuminer-sse2.exe")
+    for d in ENGINE_DLLS:
+        if d in members:
+            wanted.append(d)
+    if not wanted:
+        raise RuntimeError("The engine archive didn't contain the expected files.")
+    os.makedirs(dest, exist_ok=True)
+    for name in wanted:
+        with zf.open(members[name]) as src, open(os.path.join(dest, name), "wb") as out:
+            out.write(src.read())
+    eng = find_local_engine()
+    if not eng:
+        raise RuntimeError("Engine unpacked but no runnable build was produced.")
+    return eng
+
+
+def ensure_engine(report=lambda s: None):
+    """Resolve a runnable engine: user override → already-downloaded → download now."""
+    return find_user_miner() or find_local_engine() or download_engine(report)
+
+
+def _engine_missing_msg():
+    """Actionable message when the engine isn't available — download failure or, most
+    often, antivirus blocking the downloaded cpuminer engine."""
+    folder = engine_dir()
+    return ("The mining engine isn't available.\n\n"
+            "Either the one-time download didn't finish (check your internet), or — most "
+            "likely — your antivirus / Windows Defender blocked or removed it. EVERY CPU "
+            "miner trips this false-positive; it's the cpuminer-opt engine, not this app, "
+            "and it does nothing but hash.\n\n"
+            "Fix it once:\n"
+            "  1. Windows Security  →  Virus & threat protection.\n"
+            "  2. Under \"Protection history\", Allow / Restore any SoloLuck or cpuminer item.\n"
+            "  3. Add an Exclusion (Folder) for:\n"
+            "       %s\n"
+            "  4. Reopen SoloLuck Miner (it will re-download if needed) and click Start.\n\n"
+            "Advanced: drop your own cpuminer-opt.exe next to this app to skip the download." % folder)
 
 
 class MinerApp:
@@ -324,12 +308,13 @@ class MinerApp:
         self.accepted = 0
         self.rejected = 0
         self.hashrate = "—"
-        self.engine_path = None          # resolved cpuminer build to run
-        self._cfg_engine = ""            # cached engine basename (from cfg)
-        self._cfg_sig = ""               # cached CPU signature (from cfg)
-        self._start_ts = 0               # last miner launch time (crash guard)
-        self._saw_hash = False           # did the current run ever report a hashrate
-        self._auto_retry = False         # one auto re-select after a fast crash
+        self.engine_path = None
+        self.engine_ready = False
+        self.engine_error = None
+        self._cfg_engine = ""
+        self._cfg_sig = ""
+        self._start_ts = 0
+        self._saw_hash = False
         root.title(APP_NAME)
         root.configure(bg=BG)
         root.minsize(560, 580)
@@ -337,7 +322,6 @@ class MinerApp:
         self._load_cfg()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(200, self._pump)
-        # resolve the bundled engine in the background so the UI stays responsive
         threading.Thread(target=self._init_engine, daemon=True).start()
 
     # ---------- UI ----------
@@ -406,7 +390,7 @@ class MinerApp:
         self.acc_lbl = stat(1, "ACCEPTED")
         self.rej_lbl = stat(2, "REJECTED")
 
-        self.engine_lbl = tk.Label(self.root, text="Engine: detecting your CPU…",
+        self.engine_lbl = tk.Label(self.root, text="Engine: checking…",
                                     fg=MUTED, bg=BG, font=("Segoe UI", 8))
         self.engine_lbl.pack(anchor="w", padx=18, pady=(2, 0))
 
@@ -431,30 +415,35 @@ class MinerApp:
         else:
             self.log.insert("end", text + "\n")
         self.log.see("end")
-        # cap the log so it never grows unbounded
         if int(self.log.index("end-1c").split(".")[0]) > 600:
             self.log.delete("1.0", "200.0")
         self.log.configure(state="disabled")
 
-    # ---------- engine resolution (runs off the UI thread) ----------
+    # ---------- engine resolution (off the UI thread) ----------
     def _init_engine(self):
-        # 1) a user-supplied build in the app folder always wins
-        over = find_miner()
-        if over:
-            self.engine_path = over
-            self.q.put(("__ENG__", os.path.basename(over), "your own build"))
-            return
-        # 2) detect the best build and stage it to a stable, AV-excludable folder
-        self.q.put(("__ENGMSG__", "Engine: preparing the best build for your CPU…"))
-        p = stage_engine()
-        if p and os.path.isfile(p):
+        try:
+            over = find_user_miner()
+            if over:
+                self.engine_path = over
+                self.engine_ready = True
+                self.q.put(("__ENG__", os.path.basename(over), "your own build"))
+                return
+            local = find_local_engine()
+            if local:
+                self.engine_path = local
+                self.engine_ready = True
+                self.q.put(("__ENG__", os.path.basename(local), "ready"))
+                return
+            p = download_engine(lambda s: self.q.put(("__ENGMSG__", s)))
             self.engine_path = p
+            self.engine_ready = True
             self._cfg_engine = os.path.basename(p)
             self._cfg_sig = cpu_signature()
-            self.q.put(("__ENG__", self._cfg_engine, "bundled, auto-selected"))
+            self.q.put(("__ENG__", os.path.basename(p), "downloaded"))
             self.q.put(("__SAVECFG__", None))
-        else:
-            self.q.put(("__ENGMSG__", "Engine: blocked by antivirus? You'll get steps when you press Start."))
+        except Exception as e:
+            self.engine_error = str(e)
+            self.q.put(("__ENGERR__", str(e)))
 
     def _tier_from_name(self, name):
         n = name.lower()
@@ -516,11 +505,15 @@ class MinerApp:
         if not port.isdigit():
             messagebox.showerror(APP_NAME, "Port must be a number (e.g. 3335).")
             return
-        # the bundled engine is normally resolved at launch; if selection is still
-        # running (or this is a dev run), resolve/stage it now.
-        miner = self.engine_path or find_miner() or stage_engine()
+
+        miner = find_user_miner() or self.engine_path or find_local_engine()
         if not miner or not os.path.isfile(miner):
-            messagebox.showerror(APP_NAME, _engine_missing_msg())
+            if not self.engine_ready and not self.engine_error:
+                messagebox.showinfo(APP_NAME,
+                    "The mining engine is still downloading (one-time, ~18 MB). "
+                    "Give it a moment, then click Start again.")
+            else:
+                messagebox.showerror(APP_NAME, _engine_missing_msg())
             return
         self.engine_path = miner
 
@@ -552,10 +545,7 @@ class MinerApp:
                 universal_newlines=True, creationflags=creationflags,
                 cwd=app_dir())
         except OSError as e:
-            # WinError 2 = engine missing (quarantined); 225 = blocked outright as a
-            # virus/PUA; 226 = blocked, comment. All are antivirus interference.
             self.proc = None
-            self.engine_path = None
             if isinstance(e, FileNotFoundError) or getattr(e, "winerror", None) in (2, 225, 226):
                 messagebox.showerror(APP_NAME, _engine_missing_msg())
             else:
@@ -598,7 +588,7 @@ class MinerApp:
         if user:
             self._logln("— stopped —", MUTED)
 
-    # ---------- output parsing ----------
+    # ---------- events / output ----------
     def _pump(self):
         try:
             while True:
@@ -615,18 +605,8 @@ class MinerApp:
         kind = item[0]
         if kind == "__EXIT__":
             if self.proc is not None:
-                code = item[1]
-                crashed_fast = (time.time() - self._start_ts) < 6 and not self._saw_hash
-                self._logln("— miner exited (code %s) —" % code, RED)
+                self._logln("— miner exited (code %s) —" % item[1], RED)
                 self.stop(user=False)
-                # a fast crash with no output usually means the cached build doesn't
-                # run on this CPU (e.g. the .exe was copied here) — reselect once.
-                if crashed_fast and not self._auto_retry and not find_miner():
-                    self._auto_retry = True
-                    self._logln("Re-detecting a compatible engine and retrying…", ORANGE)
-                    self._cfg_engine = ""
-                    self.engine_path = None
-                    threading.Thread(target=self._reselect_and_restart, daemon=True).start()
         elif kind == "__ENG__":
             name, why = item[1], item[2]
             tier = self._tier_from_name(name)
@@ -636,22 +616,12 @@ class MinerApp:
                         % (name, (" — " + tier) if tier else "", why), MUTED)
         elif kind == "__ENGMSG__":
             self.engine_lbl.config(text=item[1])
+            self._logln(item[1], MUTED)
+        elif kind == "__ENGERR__":
+            self.engine_lbl.config(text="Engine: unavailable — press Start for help", fg=RED)
+            self._logln("Engine could not be prepared: %s" % item[1], RED)
         elif kind == "__SAVECFG__":
             self._save_cfg()
-        elif kind == "__RESTART__":
-            # re-enter mining on the UI thread after a successful engine re-select
-            if not self.proc:
-                self.start()
-
-    def _reselect_and_restart(self):
-        p = stage_engine()
-        if p and os.path.isfile(p):
-            self.engine_path = p
-            self._cfg_engine = os.path.basename(p)
-            self._cfg_sig = cpu_signature()
-            self.q.put(("__ENG__", self._cfg_engine, "bundled, re-selected"))
-            self.q.put(("__SAVECFG__", None))
-            self.q.put(("__RESTART__", None))
 
     def _handle_line(self, line):
         low = line.lower()
@@ -678,7 +648,6 @@ class MinerApp:
             self.rejected += 1
             self.rej_lbl.config(text=str(self.rejected))
 
-        # hashrate: prefer summary lines (total), ignore per-thread "cpu #" lines
         if "h/s" in low and not low.lstrip("[0123456789:.\\- ]").startswith("cpu #"):
             hm = HASH_RE.search(line)
             if hm:
@@ -694,66 +663,55 @@ class MinerApp:
 
 
 def _selftest():
-    """Headless build-validation: resolve the bundled engine and run it with -V to
-    confirm it launches (i.e. its bundled DLLs load) on this CPU. Writes the result
-    to a file beside the .exe and exits. Triggered by `SoloLuckMiner.exe --selftest`;
-    since the app is built --noconsole there is no stdout to read."""
+    """Headless build-validation: resolve the engine (downloading if needed) and run
+    it with -V to confirm it launches. Writes the result to a file beside the app."""
     out = os.path.join(app_dir(), "sololuck_selftest.txt")
     lines = []
     def w(s):
         lines.append(str(s))
     try:
-        w("engine_dir: %s" % engine_dir())
         w("features: %s" % cpu_features())
-        w("signature: %s" % cpu_signature())
-        eng = select_engine()
-        w("selected: %s" % eng)
+        w("preferred: %s" % preferred_builds())
+        w("engine_dir: %s" % engine_dir())
+        eng = ensure_engine(lambda s: w("  " + s))
+        w("engine: %s" % eng)
         if not eng:
-            w("RESULT: FAIL (no bundled engine found)")
+            w("RESULT: FAIL (no engine)")
         else:
-            d = os.path.dirname(eng)
-            w("engine_files: %s" % sorted(os.listdir(d)))
+            w("engine_files: %s" % sorted(os.listdir(os.path.dirname(eng))))
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
-            try:
-                r = subprocess.run([eng, "-V"], stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, timeout=20,
-                                   creationflags=flags, text=True)
-                w("engine -V exit: %s" % r.returncode)
-                w("engine -V output (first 5 lines):")
-                for ln in (r.stdout or "").splitlines()[:5]:
-                    w("  " + ln)
-                ok = r.returncode == 0 and "cpuminer" in (r.stdout or "").lower()
-                w("RESULT: %s" % ("PASS — engine launches, DLLs load" if ok else "FAIL — engine did not run cleanly"))
-            except Exception as e:
-                w("engine launch error: %r" % e)
-                w("RESULT: FAIL (engine could not be launched — missing DLL?)")
+            r = subprocess.run([eng, "-V"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               timeout=30, creationflags=flags, text=True)
+            w("engine -V exit: %s" % r.returncode)
+            for ln in (r.stdout or "").splitlines()[:5]:
+                w("  " + ln)
+            ok = r.returncode == 0 and "cpuminer" in (r.stdout or "").lower()
+            w("RESULT: %s" % ("PASS — engine downloaded + launches" if ok else "FAIL"))
     except Exception as e:
-        w("selftest error: %r" % e)
+        w("error: %r" % e)
         w("RESULT: FAIL")
     try:
-        with open(out, "w") as f:
-            f.write("\n".join(lines) + "\n")
+        open(out, "w").write("\n".join(lines) + "\n")
     except Exception:
         pass
 
 
 def _minetest(seconds, addr, threads):
-    """Headless end-to-end test: resolve the bundled engine and actually mine to the
-    live pool for `seconds`, exactly like the Start button. Writes the engine output
-    + a PASS/FAIL to a file beside the .exe. Usage:
-    SoloLuckMiner.exe --minetest <seconds> <btc-address> [threads]"""
+    """Headless end-to-end test: resolve the engine and mine live for `seconds`,
+    exactly like the Start button. Writes result beside the app.
+    Usage: SoloLuckMiner.exe --minetest <seconds> <btc-address> [threads]"""
     out = os.path.join(app_dir(), "sololuck_minetest.txt")
     log = []
     def w(s):
         log.append(str(s))
-    eng = stage_engine()   # same path the Start button uses (stages out of _MEIPASS)
-    w("engine: %s" % eng)
-    if not eng:
-        w("RESULT: FAIL (no engine)")
+    try:
+        eng = ensure_engine(lambda s: w(s))
+    except Exception as e:
+        w("engine error: %r" % e); w("RESULT: FAIL")
         open(out, "w").write("\n".join(log) + "\n"); return
+    w("engine: %s" % eng)
     url = "stratum+tcp://%s:%s" % (DEFAULT_HOST, DEFAULT_PORT)
-    user = "%s.%s" % (addr, "bundletest")
-    cmd = [eng, "-a", ALGO, "-o", url, "-u", user, "-p", "x", "-t", str(threads)]
+    cmd = [eng, "-a", ALGO, "-o", url, "-u", "%s.%s" % (addr, "bundletest"), "-p", "x", "-t", str(threads)]
     w("cmd: %s" % " ".join(cmd))
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if os.name == "nt" else 0
     captured = []
@@ -763,9 +721,8 @@ def _minetest(seconds, addr, threads):
     except Exception as e:
         w("launch error: %r" % e); w("RESULT: FAIL")
         open(out, "w").write("\n".join(log) + "\n"); return
+    threading.Thread(target=lambda: [captured.append(l.rstrip()) for l in p.stdout], daemon=True).start()
     end = time.time() + seconds
-    rdr = threading.Thread(target=lambda: [captured.append(l.rstrip()) for l in p.stdout], daemon=True)
-    rdr.start()
     while time.time() < end and p.poll() is None:
         time.sleep(0.5)
     try:
@@ -773,19 +730,15 @@ def _minetest(seconds, addr, threads):
     except Exception:
         try: p.kill()
         except Exception: pass
-    blob = "\n".join(captured)
-    low = blob.lower()
-    connected = ("stratum" in low and ("connect" in low or "subscrib" in low or "authoriz" in low or "difficulty" in low))
-    gotwork = "new work" in low or "new job" in low or "stratum requested work restart" in low
-    hashing = "h/s" in low or "khash" in low or "hash rate" in low
-    accepted = "accepted" in low or "yes!" in low
-    w("--- engine output (last 30 lines) ---")
-    for ln in captured[-30:]:
+    low = "\n".join(captured).lower()
+    connected = "stratum" in low and ("connect" in low or "subscrib" in low or "authoriz" in low or "difficulty" in low)
+    gotwork = "new work" in low or "new job" in low or "stratum diff" in low
+    hashing = "h/s" in low or "hash rate" in low
+    w("--- last 25 lines ---")
+    for ln in captured[-25:]:
         w("  " + ln)
-    w("--- signals: connected=%s gotwork=%s hashing=%s accepted=%s" % (connected, gotwork, hashing, accepted))
-    ok = connected and (gotwork or hashing)
-    w("RESULT: %s" % ("PASS — mining live to the pool" + (" (share accepted!)" if accepted else "")
-                      if ok else "FAIL — did not establish mining"))
+    w("--- signals: connected=%s gotwork=%s hashing=%s" % (connected, gotwork, hashing))
+    w("RESULT: %s" % ("PASS — mining live to the pool" if (connected and (gotwork or hashing)) else "FAIL"))
     try:
         open(out, "w").write("\n".join(log) + "\n")
     except Exception:
