@@ -3,13 +3,16 @@
 A simple Windows app that mines Bitcoin (CPU) to **sololuck.io** — a clean Start/Stop
 window with live hashrate and share counts. It drives the proven **cpuminer-opt** engine.
 
-> A PC's hashrate is tiny next to an ASIC, so this is a **lottery ticket** — which is
+> A PC's hashrate is tiny next to an ASIC, so this is a **long shot** — which is
 > exactly the point of a solo pool. If your CPU solves a block, the whole reward is paid
-> straight to *your* address on-chain (minus the pool's flat 2% fee).
+> straight to *your* address on-chain — the whole reward, 0% pool fee.
 
 This is a **clean wrapper**: it has no mining code inside it. On first run it detects your
-CPU and **downloads the matching cpuminer-opt build** (Jay D Dee's, GPLv2) into a folder
-next to the app, then runs it. Nothing to install.
+CPU and **downloads the matching build from the pinned cpuminer-opt release** (Jay D Dee's,
+GPLv2) into a folder next to the app, **verifies every file against a SHA-256 manifest
+baked into the app** (anything that doesn't match is quarantined, never run), then runs it.
+Nothing to install. If a too-new build ever crashes on an older CPU, the app automatically
+retries with the universal SSE2 build.
 
 ---
 
@@ -61,6 +64,25 @@ a single share.
 
 ---
 
+## macOS (Intel & Apple Silicon)
+There's no prebuilt macOS engine to bundle (and no notarized `.app` yet), so on a Mac the
+miner is built from source by a one-line installer. In **Terminal**:
+
+```sh
+curl -fsSL https://sololuck.io/mac-miner.sh | bash
+```
+
+It asks for your BTC address, installs build tools (Xcode Command Line Tools + Homebrew
+deps), compiles **cpuminer-opt** (falling back to **pooler/cpuminer**), and mines to
+`stratum.sololuck.io:3335` (the Nano tier). `Ctrl-C` to stop. The script is
+[`mac-miner.sh`](mac-miner.sh) in this repo.
+
+Manual: `brew install autoconf automake libtool pkg-config curl jansson`, build
+[cpuminer-opt](https://github.com/JayDDee/cpuminer-opt), then
+`cpuminer -a sha256d -o stratum+tcp://stratum.sololuck.io:3335 -u YOURADDR.mac -p x`.
+
+---
+
 ## Notes
 - A PC's hashrate is tiny vs ASICs — treat this as a lottery ticket, fitting for a solo pool.
 - Pure Python standard library (tkinter + urllib). Its only network use is downloading the
@@ -68,5 +90,22 @@ a single share.
   address never leaves your machine except as the stratum login.
 - The **cpuminer-opt** engine is GPLv2 by Jay D Dee — https://github.com/JayDDee/cpuminer-opt.
   Open-source; mine to any ckpool-style pool by changing the host/port.
+
+---
+
+## About SoloLuck (the pool)
+[SoloLuck](https://sololuck.io) is a public **true-solo** Bitcoin pool, hosted in
+**Jakarta, Indonesia** for low latency across Asia. You mine with your **own** BTC address as
+the username; if you solve a block, the network pays the full reward straight to you. The only
+fee is **0% — finders keepers**; solve a block and the whole reward is yours. Non-custodial —
+no account, no KYC.
+
+- **Stratum host:** `stratum.sololuck.io`
+  - `:3335` Nano (diff 1, CPUs/nerdminers) · `:3333` Lite (Bitaxe) · `:8081` Standard (ASIC) ·
+    `:4334` Pro · `:3334` TLS (encrypted)
+- **Coinbase tag:** `/sololuck.io/`
+- **Setup / connect:** https://sololuck.io/setup
+- **Verify the claims yourself:** https://sololuck.io/verify
+- **Compare vs other solo pools:** https://sololuck.io/compare
 
 Website: https://sololuck.io · Channel: https://t.me/SoloLuckPool

@@ -3,19 +3,22 @@
 SoloLuck Miner — a simple Start/Stop GUI that drives the cpuminer-opt CPU engine
 and points it at the SoloLuck solo Bitcoin pool (sololuck.io).
 
-A PC's hashrate is tiny next to an ASIC, so this is a lottery ticket — which is
+A PC's hashrate is tiny next to an ASIC, so this is a long shot — which is
 exactly the point of a solo pool. If your CPU happens to solve a block, the whole
-reward is paid straight to your address on-chain (minus the pool's flat 2% fee).
+reward is paid straight to your address on-chain (0% pool fee, finders keepers).
 
 This is a CLEAN WRAPPER: it contains no mining code itself. On first run it detects
-your CPU and DOWNLOADS the matching cpuminer-opt build (Jay D Dee's, GPLv2) from
-GitHub into a folder next to the app, then runs it. Nothing to install. (Advanced
+your CPU and downloads the matching build from the PINNED cpuminer-opt release
+(Jay D Dee's, GPLv2), verifies its SHA-256 against the manifest baked into this
+file, and only then runs it. An engine that fails verification is quarantined
+and never executed. Nothing to install. (Advanced
 users can drop their own cpuminer-opt.exe next to this app to skip the download.)
 
 Why a clean wrapper: a GUI with no embedded miner isn't itself flagged as a coin
 miner, so the app always launches; antivirus only ever flags the downloaded engine,
 which you whitelist once. Pure Python standard library (tkinter + urllib).
 """
+import hashlib
 import io
 import json
 import os
@@ -26,16 +29,44 @@ import sys
 import threading
 import time
 import urllib.request
+import webbrowser
 import zipfile
-import tkinter as tk
-from tkinter import messagebox, ttk
+try:
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+except ImportError:  # headless (tests) — GUI not needed for the engine logic
+    tk = messagebox = ttk = None
 
 APP_NAME = "SoloLuck Miner"
 DEFAULT_HOST = "sololuck.io"
 DEFAULT_PORT = "3335"   # Nano tier — diff 1, tuned for CPUs so shares register fast
 ALGO = "sha256d"   # Bitcoin
 ENGINE_DIR_NAME = "SoloLuckMiner-engine"
-GITHUB_RELEASE_API = "https://api.github.com/repos/JayDDee/cpuminer-opt/releases/latest"
+APP_VERSION = "1.2.0"
+# ── pinned mining engine ──────────────────────────────────────────────────────
+# Exact release, exact bytes. The app never fetches "latest", never falls back
+# to another URL or version, and never executes an engine file whose SHA-256
+# does not match this manifest (fail closed). Hashes computed from the official
+# release asset at pin time.
+ENGINE_VERSION = "v26.1"
+ENGINE_ZIP_URL = ("https://github.com/JayDDee/cpuminer-opt/releases/download/"
+                  "v26.1/cpuminer-opt-26.1-windows.zip")
+ENGINE_ZIP_SHA256 = "caf59deb12831e40475c5245a76bf42f9ba2ff620065be5386b80ec55c998e9c"
+ENGINE_FILE_SHA256 = {
+    "cpuminer-aes-sse42.exe": "454f52e4d9074a089fe2c0daefb5635ad5eae32a4bcb94b878190ae8843db547",
+    "cpuminer-avx2.exe": "4823226ef2031ad356d6a01d75d3dbce0aeb57054e2ef9d0e9bfc96e68bd42c7",
+    "cpuminer-avx2-sha.exe": "d4d1b9b66060e9453f597f54c3ee5704b82239bf94ff445a5f0f5de78af94519",
+    "cpuminer-avx2-sha-vaes.exe": "5cbae7a39b6ea0f3ca400523c300880a828b40a8470e1194890722807af9d780",
+    "cpuminer-avx512.exe": "453c351dfd0af95e497346fe2f2b8d7b3dbc90757169f09679d7b6fe8b0958ec",
+    "cpuminer-avx512-sha-vaes.exe": "a41c835bff8c404f0dc79a4f86a666f1e44dac9e5758bc31845b9dd7072f2b17",
+    "cpuminer-avx.exe": "adda67c2db1398c90adfd60498425df81b59ae0cd4924ed8d4a5c7d13d731005",
+    "cpuminer-sse2.exe": "f32e00a6947113c7da8a83940172b6f4519fa658fd0d2839ce69a00464f3798a",
+    "libcurl-4.dll": "218cfc4073bab4eddf0de0804f96b204687311e20a9e97994bff54c9b0e01ee9",
+    "libgcc_s_seh-1.dll": "c82f84171b9246d1cac261100b2199789c96c37b03b375f33b2c72afab060b05",
+    "libstdc++-6.dll": "baef1f4cabebdadc52213761b4c8e2bf381976a67bd7c490f952c38f6831b036",
+    "libwinpthread-1.dll": "2f9984c591a5654434c53e8b4d0c5c187f1fd0bab95247d5c9bc1c0bd60e6232",
+    "zlib1.dll": "61b71a00bf87ea1a63a66677de5208db7e4407287ff668e526ad609a70ef3f12",
+}
 # cpuminer-opt isn't statically linked — these ride next to whichever build we use.
 ENGINE_DLLS = ["libcurl-4.dll", "libgcc_s_seh-1.dll", "libstdc++-6.dll",
                "libwinpthread-1.dll", "zlib1.dll"]
@@ -50,6 +81,49 @@ MINER_NAMES = [
 ADDR_RE = re.compile(r"^(bc1[a-z0-9]{20,90}|[13][a-km-zA-HJ-NP-Z1-9]{20,40})$")
 HASH_RE = re.compile(r"([\d.]+)\s*([kKMGTP]?)[hH]/s")
 ACCEPT_RE = re.compile(r"[Aa]ccepted\s+(\d+)/(\d+)")
+# connection-state classification of cpuminer output lines (order matters:
+# a failure line often also contains the word "stratum"/"connect")
+_FAIL_RE = re.compile(r"connection (failed|interrupted|timed? ?out|refused|reset|closed|lost)"
+                      r"|failed to connect|unable to connect|connect failed"
+                      # bare timeouts count, but ckpool's benign 'Extranonce disabled,
+                      # subscribe timed out' on every connect does not
+                      r"|(?<!subscribe )timed? ?out"
+                      r"|retry (in|after)|retrying"
+                      r"|stratum authentication failed|authorization failed|login failed", re.I)
+_LIVE_RE = re.compile(r"difficulty (set|changed)|stratum diff|new (work|job|block)"
+                      r"|threads? started|extranonce|authoriz|subscrib"
+                      r"|connection established|connected to", re.I)
+
+
+def classify_line(line):
+    """'fail' (connection/auth problem), 'live' (talking to the pool), or None."""
+    if _FAIL_RE.search(line):
+        return "fail"
+    if _LIVE_RE.search(line):
+        return "live"
+    return None
+
+
+# Windows NTSTATUS exit codes worth translating for the user.
+_EXIT_HELP = {
+    0xC000001D: "illegal instruction — this engine build needs CPU features this machine doesn't have",
+    0xC0000005: "access violation — the engine crashed",
+    0xC0000135: "a required DLL is missing from the engine folder",
+    0xC0000409: "the engine crashed (stack error)",
+}
+
+
+def explain_exit(code):
+    """Human hint for an engine exit code ('' when there is nothing to add)."""
+    if code is None:
+        return ""
+    msg = _EXIT_HELP.get(code & 0xFFFFFFFF)
+    return (" — " + msg) if msg else ""
+
+
+def is_cpu_mismatch_exit(code):
+    """True for the crash signatures a too-new build throws on an older CPU."""
+    return code is not None and (code & 0xFFFFFFFF) in (0xC000001D, 0xC0000005)
 
 # colours (brand-ish, works on the default tk theme)
 BG = "#0b0e14"
@@ -59,6 +133,14 @@ MUTED = "#9fb0c5"
 ORANGE = "#f7931a"
 GREEN = "#3ad17a"
 RED = "#ff6b6b"
+
+# 32×32 window icon (orange rounded square + bolt), PNG, generated at build time
+ICON_B64 = ("iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAABCklEQVR42tWXsQ3CMBBF0yNRESBI"
+            "lHRMQEPNCizAArABG7AEezAHc1Aa/UgnWVbi+O47JkT6RaQo/8n/7DtX1dSfz2PjGP3ElIIZyzwJ"
+            "YmzzKAT70+dl3coMwZi/743bbWtuFRiA475uZQZgzK+nlZvNF+58WNprgckd5pAm/ywAkrsA4L0o"
+            "ADIXc4jajtbcRZb8zQB+7iJEAYhQr1uTFyDMPaaUVVEDhLn3CZApRakCCHOPKXVHJAN05d4nUz8Y"
+            "+hDFJM1G1BUHVqnYOYAi8821vYAGsBRdNgCY+QBD+z07ANuEaADJ33oE0zMBMtdOQFknImvRZQHQ"
+            "Dp9FJ+O/uBtM/2o2ictpyecL3pHtrp/wV0YAAAAASUVORK5CYII=")
 
 
 def app_dir():
@@ -160,6 +242,8 @@ def preferred_builds():
         if f["SHA"]:
             c.append("cpuminer-avx2-sha.exe")
         c.append("cpuminer-avx2.exe")
+    if f["AVX"]:
+        c.append("cpuminer-avx.exe")
     if f["SSE42"] and f["AES"]:
         c.append("cpuminer-aes-sse42.exe")
     c.append("cpuminer-sse2.exe")
@@ -210,13 +294,66 @@ def find_user_miner():
     return None
 
 
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _verify_log(msg):
+    """Verification audit trail: engine-verify.log next to the engine + stdout."""
+    line = "%s %s" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), msg)
+    try:
+        with open(os.path.join(engine_dir(), "engine-verify.log"), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+    print(line)
+
+
+def verify_engine_file(path):
+    """True iff the file's bytes match the pinned manifest for its filename."""
+    name = os.path.basename(path)
+    want = ENGINE_FILE_SHA256.get(name)
+    if not want:
+        _verify_log("verify %s: not in the pinned %s manifest -> UNVERIFIED" % (name, ENGINE_VERSION))
+        return False
+    try:
+        got = _sha256_file(path)
+    except OSError as e:
+        _verify_log("verify %s: unreadable (%s) -> FAIL" % (name, e))
+        return False
+    ok = got == want
+    _verify_log("verify %s: expected=%s actual=%s -> %s" % (name, want, got, "OK" if ok else "MISMATCH"))
+    return ok
+
+
+def _quarantine(path):
+    """Never execute a bad engine — move it aside (or delete if rename fails)."""
+    try:
+        os.replace(path, path + ".quarantined")
+        _verify_log("quarantined %s" % path)
+    except OSError:
+        try:
+            os.remove(path)
+            _verify_log("deleted unverifiable %s" % path)
+        except OSError:
+            pass
+
+
 def find_local_engine():
-    """The best already-downloaded build in the engine folder, or None."""
+    """The best already-downloaded build in the engine folder, SHA-256-verified
+    against the pinned manifest. A cached file is never assumed trusted; a
+    mismatching one is quarantined and never returned."""
     d = engine_dir()
     for b in preferred_builds():
         p = os.path.join(d, b)
         if os.path.isfile(p):
-            return p
+            if verify_engine_file(p):
+                return p
+            _quarantine(p)
     return None
 
 
@@ -229,56 +366,87 @@ def _http_get(url, want_json=False, timeout=180):
     return json.loads(data.decode("utf-8")) if want_json else data
 
 
-def _latest_engine_zip_url():
-    rel = _http_get(GITHUB_RELEASE_API, want_json=True, timeout=60)
-    assets = rel.get("assets", []) or []
-    for a in assets:
-        n = (a.get("name") or "").lower()
-        if n.endswith(".zip") and ("windows" in n or "win64" in n):
-            return a.get("browser_download_url")
-    for a in assets:
-        if (a.get("name") or "").lower().endswith(".zip"):
-            return a.get("browser_download_url")
-    raise RuntimeError("No Windows engine archive on the latest cpuminer-opt release.")
-
-
 def download_engine(report=lambda s: None):
-    """Fetch the cpuminer-opt Windows archive from GitHub and extract the build that
-    fits this CPU (+ sse2 fallback + runtime DLLs) into the engine folder. Returns a
-    runnable engine path. Raises on network/extract/AV failure."""
+    """Fetch the PINNED cpuminer-opt release archive, verify its SHA-256, then
+    extract the build matching this CPU (+ sse2 fallback + runtime DLLs), each
+    re-verified on disk. Fails closed: any mismatch aborts with a security
+    error and nothing unverified is left behind. No mirrors, no 'latest'."""
     dest = engine_dir()
-    report("Finding the latest mining engine…")
-    url = _latest_engine_zip_url()
-    report("Downloading the mining engine (~18 MB, one time)…")
-    blob = _http_get(url, timeout=300)
-    report("Unpacking…")
+    report("Downloading the pinned mining engine cpuminer-opt %s (~18 MB, one time)…" % ENGINE_VERSION)
+    _verify_log("download url=%s engine=%s" % (ENGINE_ZIP_URL, ENGINE_VERSION))
+    blob = _http_get(ENGINE_ZIP_URL, timeout=300)
+    got = hashlib.sha256(blob).hexdigest()
+    _verify_log("archive expected=%s actual=%s -> %s"
+                % (ENGINE_ZIP_SHA256, got, "OK" if got == ENGINE_ZIP_SHA256 else "MISMATCH"))
+    if got != ENGINE_ZIP_SHA256:
+        raise RuntimeError(
+            "SECURITY: the downloaded engine archive does not match the pinned "
+            "SHA-256 for cpuminer-opt %s.\nExpected %s\nGot      %s\n"
+            "Nothing was installed. Check your connection (proxy or antivirus "
+            "interception can cause this) and try again." % (ENGINE_VERSION, ENGINE_ZIP_SHA256, got))
+    report("Archive verified · unpacking…")
     zf = zipfile.ZipFile(io.BytesIO(blob))
     members = {os.path.basename(n): n for n in zf.namelist() if not n.endswith("/")}
     wanted = []
     for b in preferred_builds():
-        if b in members:
+        if b in members and b in ENGINE_FILE_SHA256:
             wanted.append(b)
             break
-    if "cpuminer-sse2.exe" in members and "cpuminer-sse2.exe" not in wanted:
+    if ("cpuminer-sse2.exe" in members and "cpuminer-sse2.exe" in ENGINE_FILE_SHA256
+            and "cpuminer-sse2.exe" not in wanted):
         wanted.append("cpuminer-sse2.exe")
+    if not any(w.endswith(".exe") for w in wanted):
+        raise RuntimeError("Unsupported CPU: no matching cpuminer-opt %s build for this machine."
+                           % ENGINE_VERSION)
     for d in ENGINE_DLLS:
         if d in members:
             wanted.append(d)
-    if not wanted:
-        raise RuntimeError("The engine archive didn't contain the expected files.")
     os.makedirs(dest, exist_ok=True)
     for name in wanted:
-        with zf.open(members[name]) as src, open(os.path.join(dest, name), "wb") as out:
-            out.write(src.read())
+        p = os.path.join(dest, name)
+        with zf.open(members[name]) as srcf, open(p, "wb") as out:
+            out.write(srcf.read())
+        if not verify_engine_file(p):
+            _quarantine(p)
+            raise RuntimeError("SECURITY: %s failed verification after extraction; "
+                               "it was quarantined and will not run." % name)
     eng = find_local_engine()
     if not eng:
-        raise RuntimeError("Engine unpacked but no runnable build was produced.")
+        raise RuntimeError("Engine unpacked but no runnable verified build was produced.")
+    report("Engine cpuminer-opt %s installed — SHA-256 verified." % ENGINE_VERSION)
     return eng
 
 
-def ensure_engine(report=lambda s: None):
-    """Resolve a runnable engine: user override → already-downloaded → download now."""
-    return find_user_miner() or find_local_engine() or download_engine(report)
+def _confirm_unverified_user_engine(path):
+    """A user-supplied engine that is NOT the pinned build runs only after an
+    explicit, informed yes. Headless: refuse (fail closed)."""
+    if messagebox is None:
+        return False
+    return bool(messagebox.askyesno(
+        APP_NAME,
+        "You placed your own engine next to the app:\n%s\n\n"
+        "It is NOT the SHA-256-verified cpuminer-opt %s build this app pins, so "
+        "SoloLuck cannot vouch for it.\n\nRun YOUR file anyway?" % (path, ENGINE_VERSION)))
+
+
+def ensure_engine(report=lambda s: None, confirm_unverified=None):
+    """Resolve a runnable engine: user override (verified, or explicitly
+    user-confirmed) → verified cached copy → verified pinned download."""
+    up = find_user_miner()
+    if up:
+        if verify_engine_file(up):
+            report("Engine cpuminer-opt %s (your copy) — SHA-256 verified." % ENGINE_VERSION)
+            return up
+        ok = (confirm_unverified or _confirm_unverified_user_engine)(up)
+        _verify_log("user-supplied engine %s unverified -> %s"
+                    % (up, "user accepted" if ok else "refused"))
+        if ok:
+            return up
+    eng = find_local_engine()
+    if eng:
+        report("Engine cpuminer-opt %s — SHA-256 verified." % ENGINE_VERSION)
+        return eng
+    return download_engine(report)
 
 
 def _engine_missing_msg():
@@ -296,7 +464,10 @@ def _engine_missing_msg():
             "  3. Add an Exclusion (Folder) for:\n"
             "       %s\n"
             "  4. Reopen SoloLuck Miner (it will re-download if needed) and click Start.\n\n"
-            "Advanced: drop your own cpuminer-opt.exe next to this app to skip the download." % folder)
+            "Note: only engine files whose SHA-256 matches the pinned engine manifest run "
+            "automatically (audit trail: engine-verify.log in that folder).\n"
+            "Advanced: drop your own cpuminer-opt.exe next to this app (you will be "
+            "asked to confirm it)." % folder)
 
 
 class MinerApp:
@@ -311,13 +482,19 @@ class MinerApp:
         self.engine_path = None
         self.engine_ready = False
         self.engine_error = None
-        self._cfg_engine = ""
-        self._cfg_sig = ""
         self._start_ts = 0
         self._saw_hash = False
-        root.title(APP_NAME)
+        self._fellback = False          # one automatic retry on the sse2 build per session
+        self._user_engine_choice = None  # remembered answer for an unverified user engine
+        self._cur_addr = ""
+        root.title("%s v%s · engine cpuminer-opt %s" % (APP_NAME, APP_VERSION, ENGINE_VERSION))
         root.configure(bg=BG)
         root.minsize(560, 580)
+        try:
+            self._icon = tk.PhotoImage(data=ICON_B64)
+            root.iconphoto(True, self._icon)
+        except Exception:
+            pass
         self._build_ui()
         self._load_cfg()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -340,7 +517,7 @@ class MinerApp:
         def row(label, default="", show=None, width=44):
             fr = tk.Frame(form, bg=BG)
             fr.pack(fill="x", pady=3)
-            tk.Label(fr, text=label, fg=MUTED, bg=BG, width=16, anchor="w",
+            tk.Label(fr, text=label, fg=MUTED, bg=BG, width=18, anchor="w",
                      font=("Segoe UI", 9)).pack(side="left")
             var = tk.StringVar(value=default)
             ent = tk.Entry(fr, textvariable=var, bg=CARD, fg=FG, insertbackground=FG,
@@ -355,7 +532,10 @@ class MinerApp:
         self.host_var, _ = row("Pool host", DEFAULT_HOST)
         self.port_var, _ = row("Port", DEFAULT_PORT)
         self.threads_var, _ = row("CPU threads", "")
-        tk.Label(form, text="(threads blank = auto / all cores)", fg=MUTED, bg=BG,
+        ncpu = os.cpu_count() or 0
+        hint = ("(blank = all %d cores; use fewer to keep the PC cool)" % ncpu) if ncpu \
+            else "(threads blank = auto / all cores)"
+        tk.Label(form, text=hint, fg=MUTED, bg=BG,
                  font=("Segoe UI", 8)).pack(anchor="w", padx=(120, 0))
 
         btns = tk.Frame(self.root, bg=BG)
@@ -375,7 +555,9 @@ class MinerApp:
         stats.pack(fill="x", **pad)
         self.status_lbl = tk.Label(stats, text="● stopped", fg=MUTED, bg=BG,
                                    font=("Segoe UI", 10, "bold"))
-        self.status_lbl.grid(row=0, column=0, sticky="w", columnspan=3, pady=(0, 6))
+        self.status_lbl.grid(row=0, column=0, sticky="w", columnspan=2, pady=(0, 6))
+        self.time_lbl = tk.Label(stats, text="", fg=MUTED, bg=BG, font=("Segoe UI", 9))
+        self.time_lbl.grid(row=0, column=2, sticky="e", pady=(0, 6))
 
         def stat(col, title):
             f = tk.Frame(stats, bg=CARD)
@@ -390,6 +572,11 @@ class MinerApp:
         self.acc_lbl = stat(1, "ACCEPTED")
         self.rej_lbl = stat(2, "REJECTED")
 
+        # appears after the first accepted share — opens the pool's stats page
+        self.link_lbl = tk.Label(self.root, text="", fg=ORANGE, bg=BG, cursor="hand2",
+                                 font=("Segoe UI", 9, "underline"))
+        self.link_lbl.bind("<Button-1>", self._open_stats)
+
         self.engine_lbl = tk.Label(self.root, text="Engine: checking…",
                                     fg=MUTED, bg=BG, font=("Segoe UI", 8))
         self.engine_lbl.pack(anchor="w", padx=18, pady=(2, 0))
@@ -398,13 +585,19 @@ class MinerApp:
         logf.pack(fill="both", expand=True, padx=14, pady=(6, 14))
         tk.Label(logf, text="Miner log", fg=MUTED, bg=BG,
                  font=("Segoe UI", 9)).pack(anchor="w")
-        self.log = tk.Text(logf, bg="#080b10", fg=MUTED, relief="flat", wrap="word",
+        body = tk.Frame(logf, bg=BG)
+        body.pack(fill="both", expand=True)
+        self.log = tk.Text(body, bg="#080b10", fg=MUTED, relief="flat", wrap="word",
                            font=("Consolas", 9), height=12, insertbackground=FG)
-        self.log.pack(fill="both", expand=True)
-        sb = ttk.Scrollbar(self.log, command=self.log.yview)
+        sb = ttk.Scrollbar(body, command=self.log.yview)
         self.log.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="both", expand=True)
         self.log.configure(state="disabled")
+
+    def _open_stats(self, _event=None):
+        if self._cur_addr:
+            webbrowser.open("https://sololuck.io/users/%s" % self._cur_addr)
 
     def _logln(self, text, color=None):
         self.log.configure(state="normal")
@@ -420,27 +613,33 @@ class MinerApp:
         self.log.configure(state="disabled")
 
     # ---------- engine resolution (off the UI thread) ----------
+    def _engine_ok(self, path, why):
+        self.engine_path = path
+        self.engine_ready = True
+        self.engine_error = None
+        self.q.put(("__ENG__", os.path.basename(path), why))
+
     def _init_engine(self):
+        """Same trust rules as ensure_engine(), but the 'run YOUR unverified
+        file?' question is bounced to the UI thread via the queue."""
         try:
             over = find_user_miner()
             if over:
-                self.engine_path = over
-                self.engine_ready = True
-                self.q.put(("__ENG__", os.path.basename(over), "your own build"))
-                return
+                if verify_engine_file(over):
+                    self._engine_ok(over, "your copy — SHA-256 verified")
+                    return
+                if self._user_engine_choice is True:
+                    self._engine_ok(over, "your own build (unverified — you approved it)")
+                    return
+                if self._user_engine_choice is None:
+                    self.q.put(("__CONFIRM__", over))
+                    return  # resolution continues after the user answers
             local = find_local_engine()
             if local:
-                self.engine_path = local
-                self.engine_ready = True
-                self.q.put(("__ENG__", os.path.basename(local), "ready"))
+                self._engine_ok(local, "SHA-256 verified")
                 return
             p = download_engine(lambda s: self.q.put(("__ENGMSG__", s)))
-            self.engine_path = p
-            self.engine_ready = True
-            self._cfg_engine = os.path.basename(p)
-            self._cfg_sig = cpu_signature()
-            self.q.put(("__ENG__", os.path.basename(p), "downloaded"))
-            self.q.put(("__SAVECFG__", None))
+            self._engine_ok(p, "downloaded + SHA-256 verified")
         except Exception as e:
             self.engine_error = str(e)
             self.q.put(("__ENGERR__", str(e)))
@@ -469,8 +668,6 @@ class MinerApp:
             self.host_var.set(c.get("host", DEFAULT_HOST))
             self.port_var.set(c.get("port", DEFAULT_PORT))
             self.threads_var.set(c.get("threads", ""))
-            self._cfg_engine = c.get("engine", "")
-            self._cfg_sig = c.get("engine_sig", "")
         except Exception:
             pass
 
@@ -481,13 +678,29 @@ class MinerApp:
                            "worker": self.worker_var.get().strip(),
                            "host": self.host_var.get().strip(),
                            "port": self.port_var.get().strip(),
-                           "threads": self.threads_var.get().strip(),
-                           "engine": self._cfg_engine,
-                           "engine_sig": self._cfg_sig}, f)
+                           "threads": self.threads_var.get().strip()}, f)
         except Exception:
             pass
 
     # ---------- mining control ----------
+    def _resolve_start_engine(self):
+        """Engine for this Start click. A user-dropped build still wins, but only
+        SHA-256-verified — or after the same explicit yes the init path uses
+        (remembered for the session). After an auto-fallback, stick to it."""
+        if self._fellback:
+            return self.engine_path
+        up = find_user_miner()
+        if up and up != self.engine_path:
+            if verify_engine_file(up):
+                return up
+            if self._user_engine_choice is None:
+                self._user_engine_choice = _confirm_unverified_user_engine(up)
+                _verify_log("user-supplied engine %s unverified -> %s"
+                            % (up, "user accepted" if self._user_engine_choice else "refused"))
+            if self._user_engine_choice:
+                return up
+        return self.engine_path or find_local_engine()
+
     def start(self):
         if self.proc:
             return
@@ -502,17 +715,22 @@ class MinerApp:
                 "That doesn't look like a Bitcoin address.\n\nUse the address you want the "
                 "block reward paid to (e.g. bc1q…). In solo mode the address IS your login.")
             return
-        if not port.isdigit():
-            messagebox.showerror(APP_NAME, "Port must be a number (e.g. 3335).")
+        if not port.isdigit() or not 1 <= int(port) <= 65535:
+            messagebox.showerror(APP_NAME, "Port must be a number between 1 and 65535 (e.g. 3335).")
             return
 
-        miner = find_user_miner() or self.engine_path or find_local_engine()
+        miner = self._resolve_start_engine()
         if not miner or not os.path.isfile(miner):
             if not self.engine_ready and not self.engine_error:
                 messagebox.showinfo(APP_NAME,
                     "The mining engine is still downloading (one-time, ~18 MB). "
                     "Give it a moment, then click Start again.")
-            else:
+            elif self.engine_error and messagebox.askretrycancel(
+                    APP_NAME, _engine_missing_msg() + "\n\nRetry the download now?"):
+                self.engine_error = None
+                self.engine_lbl.config(text="Engine: downloading…", fg=MUTED)
+                threading.Thread(target=self._init_engine, daemon=True).start()
+            elif not self.engine_error:
                 messagebox.showerror(APP_NAME, _engine_missing_msg())
             return
         self.engine_path = miner
@@ -530,6 +748,7 @@ class MinerApp:
         self.hr_lbl.config(text="…")
         self._saw_hash = False
         self._start_ts = time.time()
+        self._cur_addr = addr
         self._save_cfg()
         self._logln("$ %s -a %s -o %s -u %s -p x%s"
                     % (os.path.basename(miner), ALGO, url, user,
@@ -556,31 +775,37 @@ class MinerApp:
             messagebox.showerror(APP_NAME, "Couldn't launch the miner:\n%s" % e)
             return
 
-        self.reader = threading.Thread(target=self._read_output, daemon=True)
+        self.reader = threading.Thread(target=self._read_output, args=(self.proc,), daemon=True)
         self.reader.start()
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.status_lbl.config(text="● connecting…", fg=ORANGE)
 
-    def _read_output(self):
+    def _read_output(self, p):
         try:
-            for line in self.proc.stdout:
+            for line in p.stdout:
                 self.q.put(line.rstrip("\n"))
         except Exception:
             pass
-        self.q.put(("__EXIT__", self.proc.poll() if self.proc else None))
+        self.q.put(("__EXIT__", p.poll(), p))
 
     def stop(self, user=True):
-        if self.proc:
+        p, self.proc = self.proc, None
+        if p:
+            # terminate now; wait/kill off the UI thread so the window never freezes
             try:
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=4)
-                except Exception:
-                    self.proc.kill()
+                p.terminate()
             except Exception:
                 pass
-        self.proc = None
+            def _reap():
+                try:
+                    p.wait(timeout=4)
+                except Exception:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+            threading.Thread(target=_reap, daemon=True).start()
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         self.status_lbl.config(text="● stopped", fg=MUTED)
@@ -599,39 +824,78 @@ class MinerApp:
                 self._handle_line(item)
         except queue.Empty:
             pass
+        if self.proc is not None and self._start_ts:
+            s = int(time.time() - self._start_ts)
+            self.time_lbl.config(text="⏱ %d:%02d:%02d" % (s // 3600, s % 3600 // 60, s % 60))
+        elif self.time_lbl.cget("text"):
+            self.time_lbl.config(text="")
         self.root.after(200, self._pump)
 
     def _handle_event(self, item):
         kind = item[0]
         if kind == "__EXIT__":
+            if len(item) > 2 and item[2] is not self.proc:
+                return  # a previous run's reader finishing — not the live miner
             if self.proc is not None:
-                self._logln("— miner exited (code %s) —" % item[1], RED)
+                code = item[1]
+                self._logln("— miner exited (code %s%s) —" % (code, explain_exit(code)), RED)
+                if self._try_sse2_fallback(code):
+                    return
                 self.stop(user=False)
         elif kind == "__ENG__":
             name, why = item[1], item[2]
             tier = self._tier_from_name(name)
             self.engine_lbl.config(
-                text="Engine: %s%s · %s" % (name, (" (" + tier + ")") if tier else "", why))
+                text="Engine: %s%s · %s" % (name, (" (" + tier + ")") if tier else "", why),
+                fg=MUTED)
             self._logln("Engine ready: %s%s [%s]"
                         % (name, (" — " + tier) if tier else "", why), MUTED)
         elif kind == "__ENGMSG__":
-            self.engine_lbl.config(text=item[1])
+            self.engine_lbl.config(text=item[1], fg=MUTED)
             self._logln(item[1], MUTED)
         elif kind == "__ENGERR__":
             self.engine_lbl.config(text="Engine: unavailable — press Start for help", fg=RED)
             self._logln("Engine could not be prepared: %s" % item[1], RED)
-        elif kind == "__SAVECFG__":
-            self._save_cfg()
+        elif kind == "__CONFIRM__":
+            self._user_engine_choice = _confirm_unverified_user_engine(item[1])
+            _verify_log("user-supplied engine %s unverified -> %s"
+                        % (item[1], "user accepted" if self._user_engine_choice else "refused"))
+            threading.Thread(target=self._init_engine, daemon=True).start()
+
+    def _try_sse2_fallback(self, code):
+        """A too-new build crashing on launch (illegal instruction) auto-retries
+        once on the universal sse2 build instead of leaving a cryptic error."""
+        ran_short = time.time() - self._start_ts < 12
+        if (self._fellback or self._saw_hash or not ran_short
+                or not is_cpu_mismatch_exit(code)):
+            return False
+        cur = os.path.basename(self.engine_path or "")
+        if cur == "cpuminer-sse2.exe":
+            return False
+        sse2 = os.path.join(engine_dir(), "cpuminer-sse2.exe")
+        if not (os.path.isfile(sse2) and verify_engine_file(sse2)):
+            return False
+        self._fellback = True
+        self.engine_path = sse2
+        self.stop(user=False)
+        self._logln("That engine build crashed right away — your CPU may not support it. "
+                    "Retrying with the baseline SSE2 build (works on any 64-bit CPU)…", ORANGE)
+        self.start()
+        return True
 
     def _handle_line(self, line):
         low = line.lower()
         color = None
+        state = classify_line(line)
         if "accepted" in low or "yes!" in low:
             color = GREEN
             self.status_lbl.config(text="● mining", fg=GREEN)
         elif "rejected" in low or "booo" in low:
             color = RED
-        elif "stratum" in low or "connect" in low:
+        elif state == "fail":
+            color = RED
+            self.status_lbl.config(text="● reconnecting…", fg=ORANGE)
+        elif state == "live":
             self.status_lbl.config(text="● mining", fg=GREEN)
 
         m = ACCEPT_RE.search(line)
@@ -647,6 +911,11 @@ class MinerApp:
         elif "rejected" in low:
             self.rejected += 1
             self.rej_lbl.config(text=str(self.rejected))
+        if self.accepted > 0 and self._cur_addr and not self.link_lbl.winfo_ismapped():
+            self.link_lbl.config(text="Share accepted — see your worker at "
+                                      "sololuck.io/users/%s…" % self._cur_addr[:12])
+            self.link_lbl.pack(anchor="w", padx=18, pady=(2, 0),
+                               before=self.engine_lbl)
 
         if "h/s" in low and not low.lstrip("[0123456789:.\\- ]").startswith("cpu #"):
             hm = HASH_RE.search(line)
@@ -704,6 +973,9 @@ def _minetest(seconds, addr, threads):
     log = []
     def w(s):
         log.append(str(s))
+    if not ADDR_RE.match(addr or ""):
+        w("bad or missing BTC address %r" % addr); w("RESULT: FAIL")
+        open(out, "w").write("\n".join(log) + "\n"); return
     try:
         eng = ensure_engine(lambda s: w(s))
     except Exception as e:
@@ -757,9 +1029,20 @@ def main():
         thr = int(rest[2]) if len(rest) > 2 and rest[2].isdigit() else 2
         _minetest(secs, addr, thr)
         return
+    if os.name == "nt":
+        # crisp text on high-DPI displays (Tk then picks up the real DPI itself)
+        try:
+            import ctypes
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            except Exception:
+                ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
     root = tk.Tk()
     try:
-        root.tk.call("tk", "scaling", 1.2)
+        if float(root.tk.call("tk", "scaling")) < 1.2:
+            root.tk.call("tk", "scaling", 1.2)
     except Exception:
         pass
     MinerApp(root)
