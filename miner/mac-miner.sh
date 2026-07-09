@@ -2,13 +2,13 @@
 # SoloLuck — Mac CPU solo miner (Intel + Apple Silicon).
 # Finds or builds a CPU miner from source and points it at sololuck.io, mining
 # Bitcoin solo to YOUR own address. No Apple account needed (terminal, not a
-# notarized app). A Mac's hashrate is tiny, so this is a low-power lottery ticket.
+# notarized app). A Mac's hashrate is tiny, so this is a low-power long shot.
 #
-#   curl -fsSL https://sololuck.io/mac-miner.sh | bash
+#   curl -fLO https://sololuck.io/mac-miner.sh && less mac-miner.sh && bash mac-miner.sh
 #   ./mac-miner.sh bc1qyouraddress
 #
-# Open-source, non-custodial: the reward (0% pool fee — finders keepers) on a solved
-# block) is paid straight to your address on-chain. We never hold it.
+# Open-source, non-custodial, 0% fee: the entire reward on a solved block is
+# paid straight to your address on-chain. We never hold it.
 set -uo pipefail
 
 POOL_HOST="stratum.sololuck.io"
@@ -23,9 +23,9 @@ c_g(){ printf '\033[1;32m%s\033[0m\n' "$*"; }
 
 c_y "── SoloLuck · Mac CPU solo miner ───────────────────────────────"
 echo "Mines Bitcoin (CPU) solo to YOUR address via $POOL_HOST:$POOL_PORT."
-echo "Solo mining is a lottery — a Mac's hashrate is tiny, so think of it as a"
-echo "cheap, low-power ticket. If your Mac solves a block, the whole reward is"
-echo "yours (0% pool fee, finders keepers), paid on-chain to your address. No account."
+echo "Solo mining is a long shot — a Mac's hashrate is tiny, so think of it as a"
+echo "cheap, low-power experiment. If your Mac solves a block, the whole reward is"
+echo "entirely yours — 0% fee — paid on-chain to your address. No account."
 echo
 
 [ "$(uname)" = "Darwin" ] || { c_r "This installer is for macOS. For Windows see https://sololuck.io/setup"; exit 1; }
@@ -122,11 +122,13 @@ fi
 
 [ -n "$ENGINE" ] && [ -x "$ENGINE" ] || { c_r "No runnable engine. See https://sololuck.io/setup"; exit 1; }
 
-# leave one core free so the Mac stays usable
-THREADS="$(sysctl -n hw.ncpu 2>/dev/null || echo 2)"
-[ "$THREADS" -gt 1 ] 2>/dev/null && THREADS=$((THREADS-1)) || THREADS=1
+# 75% of cores + low process priority: the Mac stays usable while it mines.
+NCPU="$(sysctl -n hw.ncpu 2>/dev/null || echo 2)"
+THREADS=$(( NCPU * 75 / 100 ))
+[ "$THREADS" -ge 1 ] 2>/dev/null || THREADS=1
 
 c_g "Engine ready: $ENGINE"
 c_g "Mining to ${ADDR}.${WORKER} on $POOL_HOST:$POOL_PORT  (Ctrl-C to stop)"
+echo "CPU load: 75% (${THREADS} of ${NCPU} threads, low priority - will not fight your real work)"
 echo
-exec "$ENGINE" -a "$ALGO" -o "stratum+tcp://$POOL_HOST:$POOL_PORT" -u "${ADDR}.${WORKER}" -p x -t "$THREADS"
+exec nice -n 10 "$ENGINE" -a "$ALGO" -o "stratum+tcp://$POOL_HOST:$POOL_PORT" -u "${ADDR}.${WORKER}" -p x -t "$THREADS"
