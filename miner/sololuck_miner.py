@@ -42,7 +42,7 @@ DEFAULT_HOST = "sololuck.io"
 DEFAULT_PORT = "3335"   # Nano tier — diff 1, tuned for CPUs so shares register fast
 ALGO = "sha256d"   # Bitcoin
 ENGINE_DIR_NAME = "SoloLuckMiner-engine"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 CHANGELOG_URL = "https://sololuck.io/changelog"
 # The pool endpoint is fixed: this is the SoloLuck app, and the Nano tier's
 # difficulty is what makes CPU shares register fast. (Generic pools have
@@ -806,6 +806,8 @@ class MinerApp:
         self._last_cores = None
         self._last_meter_ts = 0
         self._update_info = None
+        self._update_path = None
+        self._update_downloading = False
         root.title("%s v%s · engine cpuminer-opt %s" % (APP_NAME, APP_VERSION, ENGINE_VERSION))
         root.configure(bg=BG)
         root.minsize(560, 580)
@@ -1073,17 +1075,12 @@ class MinerApp:
         if info:
             self.q.put(("__UPDATE__", info))
 
-    def _do_update(self):
-        """Download the newer versioned exe, verify it, launch it, and close.
-        Source runs (not frozen) just open the download page."""
-        info = self._update_info
-        if not info:
+    def _start_download(self):
+        """Fetch + verify the update in the background (only meaningful frozen)."""
+        if not getattr(sys, "frozen", False) or self._update_downloading:
             return
-        if not getattr(sys, "frozen", False):
-            webbrowser.open("https://sololuck.io/setup")
-            return
-        self.update_btn.config(state="disabled", text="Updating…")
-        threading.Thread(target=self._run_update, args=(info,), daemon=True).start()
+        self._update_downloading = True
+        threading.Thread(target=self._run_update, args=(self._update_info,), daemon=True).start()
 
     def _run_update(self, info):
         try:
@@ -1092,6 +1089,33 @@ class MinerApp:
             self.q.put(("__UPDERR__", str(e)))
             return
         self.q.put(("__UPDREADY__", path))
+
+    def _do_update(self, _event=None):
+        """Banner button. Source builds open the download page; frozen builds
+        apply the verified update now (or the moment the download finishes)."""
+        if not getattr(sys, "frozen", False):
+            webbrowser.open("https://sololuck.io/setup")
+            return
+        if self._update_path:
+            self._apply_update()
+        else:
+            self._start_download()
+            self.update_btn.config(state="disabled", text="Downloading…")
+
+    def _apply_update(self):
+        """Stop mining if needed, launch the verified new exe, and close."""
+        if not self._update_path:
+            return
+        self.stop(user=False)
+        self._logln("Applying update — restarting into the new version…", GREEN)
+        try:
+            subprocess.Popen([self._update_path],
+                             cwd=os.path.dirname(self._update_path) or None)
+            self.root.after(400, self.on_close)
+        except Exception as e:
+            self.update_btn.config(state="normal", text="Update now")
+            messagebox.showerror(APP_NAME, "Couldn't launch the update:\n%s\n\n"
+                                 "Download it from sololuck.io/setup." % e)
 
     # ---------- CPU load slider ----------
     def _on_pct(self, _value=None):
@@ -1107,7 +1131,12 @@ class MinerApp:
                             fg=GREEN if safe else ORANGE)
 
     def _on_full(self):
-        if not self.full_var.get() and self.pct_var.get() > CPU_PCT_SOFT_MAX:
+        # ticking "Allow 100%" means use full power — jump the slider to 100 so
+        # the setting actually takes effect (previously it stayed at the 80 cap,
+        # so a checked box still mined at 80%). Unticking pulls back to the cap.
+        if self.full_var.get():
+            self.pct_var.set(100)
+        elif self.pct_var.get() > CPU_PCT_SOFT_MAX:
             self.pct_var.set(CPU_PCT_SOFT_MAX)
         self._on_pct()
 
@@ -1329,6 +1358,9 @@ class MinerApp:
         self.hr_lbl.config(text="—")
         if user:
             self._logln("— stopped —", MUTED)
+            # a verified update was waiting for the miner to stop → apply it now
+            if self._update_path:
+                self.root.after(300, self._apply_update)
 
     # ---------- events / output ----------
     def _pump(self):
@@ -1384,25 +1416,33 @@ class MinerApp:
             threading.Thread(target=self._init_engine, daemon=True).start()
         elif kind == "__UPDATE__":
             self._update_info = item[1]
-            self.update_lbl.config(text="⬆ SoloLuck Miner v%s is available" % item[1]["version"])
+            ver = item[1]["version"]
             self.update_bar.pack(fill="x", padx=14, pady=(0, 4),
                                  after=self.root.winfo_children()[0])
-            self._logln("A newer version (v%s) is available — click Update in the banner."
-                        % item[1]["version"], GREEN)
+            if getattr(sys, "frozen", False):
+                # auto-download+verify in the background straight away
+                self.update_lbl.config(text="⬆ v%s available — downloading…" % ver)
+                self.update_btn.config(state="disabled", text="Downloading…")
+                self._start_download()
+            else:
+                self.update_lbl.config(text="⬆ SoloLuck Miner v%s is available" % ver)
+                self.update_btn.config(text="Get it")
+            self._logln("A newer version (v%s) is available." % ver, GREEN)
         elif kind == "__UPDREADY__":
-            self._logln("Update downloaded and verified. Restarting into the new version…", GREEN)
-            try:
-                subprocess.Popen([item[1]], cwd=os.path.dirname(item[1]) or None)
-                self.root.after(400, self.on_close)
-            except Exception as e:
-                self.update_btn.config(state="normal", text="Update now")
-                messagebox.showerror(APP_NAME, "Couldn't launch the update:\n%s\n\n"
-                                     "You can download it from sololuck.io/setup." % e)
-        elif kind == "__UPDERR__":
+            self._update_path = item[1]
             self.update_btn.config(state="normal", text="Update now")
+            if self.proc is None:
+                self._logln("Update verified — installing now…", GREEN)
+                self._apply_update()       # idle → auto-install
+            else:
+                self.update_lbl.config(
+                    text="⬆ v%s downloaded — installs when you Stop" % self._update_info["version"])
+                self._logln("Update downloaded and verified — it will install when you stop "
+                            "mining, or click Update now.", GREEN)
+        elif kind == "__UPDERR__":
+            self._update_downloading = False
+            self.update_btn.config(state="normal", text="Retry update")
             self._logln("Update failed: %s" % item[1], RED)
-            messagebox.showerror(APP_NAME, "The update could not be verified or downloaded:\n\n%s\n\n"
-                                 "Get it manually from sololuck.io/setup." % item[1])
 
     def _try_sse2_fallback(self, code):
         """A too-new build crashing on launch (illegal instruction) auto-retries

@@ -1,5 +1,14 @@
 # SoloLuck Miner — changelog
 
+## v1.6.0 — 2026-07-10
+- Fix: ticking "Allow 100% CPU" now actually runs at 100%. Before, if the
+  slider had snapped back to the 80% cap, checking the box left it at 80% — so
+  a "100%"-checked miner kept hashing at 80%. Ticking the box now sets 100%.
+- Auto-install updates: when a newer version is found the app downloads and
+  SHA-256-verifies it in the background, then installs automatically the moment
+  you are not mining (or immediately if idle). Mining is never interrupted —
+  a verified update waits and applies when you Stop, or on demand.
+
 ## v1.5.0 — 2026-07-10
 - Auto-detected CPU panel: your processor name, core/thread count and the exact
   cpuminer SIMD path it will use for mining (e.g. "AVX-512 + SHA" on modern AMD,
