@@ -1,5 +1,18 @@
 # SoloLuck Miner — changelog
 
+## v1.8.0 — 2026-07-10
+- CPU load is now hard-capped at 90% (was 100%). The last few threads add very
+  little hashrate for a lot of extra heat, and full load can make the PC
+  unresponsive — 90% keeps it usable while giving up almost nothing. The old
+  "use 100%" option has been removed; old settings are migrated to the cap.
+- Antivirus shield (Windows): a one-click "Shield it" that adds a Windows
+  Defender exclusion for the mining-engine folder (asks for the usual admin
+  prompt). This matters a lot — if Defender quarantines the fast AVX-512/AVX2
+  engine, the app silently falls back to the slow baseline build, which can cut
+  your hashrate by ~8-10×. Shielding keeps you on the fast engine.
+- Per-CPU engine selection is unchanged (already optimal): AVX-512+SHA on modern
+  AMD, AVX2+SHA on recent Intel, down to an SSE2 baseline on older CPUs.
+
 ## v1.7.0 — 2026-07-10
 - Fix: "Use 100% of the CPU" (full load) is now reliable. A configuration saved
   by an earlier build could restore the box as checked but the slider at the 80%

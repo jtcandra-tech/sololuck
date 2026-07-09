@@ -142,15 +142,21 @@ class TestThreadsFor(unittest.TestCase):
             self.assertEqual(m.threads_for(25, ncpu), 1)
         self.assertEqual(m.threads_for(25, None), 1)
 
-    def test_full_load_uses_all_cores(self):
-        self.assertEqual(m.threads_for(100, 12), 12)
+    def test_hard_cap_90(self):
+        # v1.8: load is hard-capped at 90% — 100% requests can never exceed the cap
+        self.assertEqual(m.CPU_PCT_HARD_MAX, 90)
+        self.assertEqual(m.threads_for(100, 12), m.threads_for(90, 12))
+        self.assertEqual(m.threads_for(90, 12), 11)   # round(12*0.9)=10.8 -> 11
+        self.assertEqual(m.threads_for(90, 16), 14)    # round(16*0.9)=14.4 -> 14
+        # a request above the cap is clamped down to the cap, never all cores
+        self.assertLess(m.threads_for(100, 12), 12)
 
     def test_soft_max(self):
         self.assertEqual(m.threads_for(80, 12), 10)
 
     def test_clamps_and_garbage(self):
         self.assertEqual(m.threads_for(5, 12), m.threads_for(m.CPU_PCT_MIN, 12))
-        self.assertEqual(m.threads_for(250, 12), 12)
+        self.assertEqual(m.threads_for(250, 12), m.threads_for(m.CPU_PCT_HARD_MAX, 12))
         self.assertEqual(m.threads_for("junk", 12), m.threads_for(m.CPU_PCT_DEFAULT, 12))
 
 

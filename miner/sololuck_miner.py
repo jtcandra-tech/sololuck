@@ -18,6 +18,7 @@ Why a clean wrapper: a GUI with no embedded miner isn't itself flagged as a coin
 miner, so the app always launches; antivirus only ever flags the downloaded engine,
 which you whitelist once. Pure Python standard library (tkinter + urllib).
 """
+import base64
 import hashlib
 import io
 import json
@@ -42,7 +43,7 @@ DEFAULT_HOST = "sololuck.io"
 DEFAULT_PORT = "3335"   # Nano tier — diff 1, tuned for CPUs so shares register fast
 ALGO = "sha256d"   # Bitcoin
 ENGINE_DIR_NAME = "SoloLuckMiner-engine"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 CHANGELOG_URL = "https://sololuck.io/changelog"
 # The pool endpoint is fixed: this is the SoloLuck app, and the Nano tier's
 # difficulty is what makes CPU shares register fast. (Generic pools have
@@ -52,7 +53,10 @@ POOL_LABEL = "stratum+tcp://%s:%s" % (DEFAULT_HOST, DEFAULT_PORT)
 # so 100% is opt-in via an explicit checkbox; without it the slider tops out
 # at the soft max.
 CPU_PCT_MIN = 25
-CPU_PCT_SOFT_MAX = 80
+CPU_PCT_SOFT_MAX = 80      # green "recommended" ceiling; above this is amber "high load"
+CPU_PCT_HARD_MAX = 90      # v1.8: absolute cap — the miner never uses more, so the PC
+                          # stays usable and we shed only the top threads (little hashrate,
+                          # lots of heat). There is no 100% option any more.
 CPU_PCT_DEFAULT = 25
 # ── pinned mining engine ──────────────────────────────────────────────────────
 # Exact release, exact bytes. The app never fetches "latest", never falls back
@@ -142,7 +146,7 @@ def threads_for(pct, ncpu):
         pct = int(pct)
     except (TypeError, ValueError):
         pct = CPU_PCT_DEFAULT
-    pct = max(CPU_PCT_MIN, min(100, pct))
+    pct = max(CPU_PCT_MIN, min(CPU_PCT_HARD_MAX, pct))
     return max(1, int(round((ncpu or 1) * pct / 100.0)))
 
 
@@ -586,6 +590,51 @@ def engine_dir():
     return os.path.join(app_dir(), ENGINE_DIR_NAME)
 
 
+def _ps_run(command, timeout=15):
+    """Run a short PowerShell command hidden, return stdout (Windows only)."""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    out = subprocess.run(["powershell", "-NoProfile", "-Command", command],
+                         capture_output=True, text=True, timeout=timeout,
+                         creationflags=flags)
+    return out.stdout or ""
+
+
+def av_exclusion_present():
+    """Is the engine folder already a Windows Defender path-exclusion?
+    True / False on Windows; None when we can't tell (not Windows, no Defender,
+    query blocked) — callers hide the UI on None rather than nag."""
+    if os.name != "nt":
+        return None
+    try:
+        d = os.path.normcase(os.path.normpath(engine_dir()))
+        paths = [os.path.normcase(os.path.normpath(p.strip()))
+                 for p in _ps_run("(Get-MpPreference).ExclusionPath").splitlines() if p.strip()]
+        return d in paths
+    except Exception:
+        return None
+
+
+def add_av_exclusion():
+    """Add a Defender exclusion for the engine folder. Needs admin, so it elevates
+    via a single UAC prompt (ShellExecute 'runas'). Returns True if the elevation
+    launched (not proof it was approved), False on failure / non-Windows."""
+    if os.name != "nt":
+        return False
+    try:
+        d = engine_dir().replace("'", "''")
+        ps = ("Add-MpPreference -ExclusionPath '%s'; "
+              "Add-MpPreference -ExclusionProcess 'cpuminer-*.exe'" % d)
+        import ctypes
+        # -EncodedCommand avoids nested-quote breakage; run hidden + elevated
+        b64 = base64.b64encode(ps.encode("utf-16-le")).decode()
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", "powershell",
+            "-NoProfile -WindowStyle Hidden -EncodedCommand %s" % b64, None, 0)
+        return int(rc) > 32
+    except Exception:
+        return False
+
+
 def find_user_miner():
     """A user-supplied cpuminer build dropped in the app folder (skips the download)."""
     d = app_dir()
@@ -891,7 +940,7 @@ class MinerApp:
         tk.Label(ldf, text="CPU load", fg=MUTED, bg=CARD, width=18, anchor="w",
                  font=("Segoe UI", 9)).pack(side="left")
         self.pct_var = tk.IntVar(value=CPU_PCT_DEFAULT)
-        self.pct_scale = tk.Scale(ldf, from_=CPU_PCT_MIN, to=100, orient="horizontal",
+        self.pct_scale = tk.Scale(ldf, from_=CPU_PCT_MIN, to=CPU_PCT_HARD_MAX, orient="horizontal",
                                   variable=self.pct_var, command=self._on_pct,
                                   showvalue=0, bg=ORANGE, fg=FG, troughcolor=BG,
                                   activebackground=ORANGE_HOT, highlightthickness=0,
@@ -901,15 +950,23 @@ class MinerApp:
         self.pct_lbl = tk.Label(inner, text="", bg=CARD, anchor="w",
                                 font=("Segoe UI", 9, "bold"))
         self.pct_lbl.pack(anchor="w", padx=(118, 0))
-        self.full_var = tk.BooleanVar(value=False)
-        self.full_chk = tk.Checkbutton(
-            inner, variable=self.full_var, command=self._on_full,
-            text="Use 100% of the CPU — full load for the best hashrate and lottery "
-                 "odds (also fine for a stress-test / burn-in). The PC will be slower "
-                 "for other work while mining.",
-            bg=CARD, fg=MUTED, activebackground=CARD, activeforeground=FG,
-            selectcolor=BG, font=("Segoe UI", 8), anchor="w", highlightthickness=0)
-        self.full_chk.pack(anchor="w", padx=(118, 0))
+        tk.Label(inner, text="Load is capped at 90% so the PC stays usable — the top few "
+                 "threads add little hashrate for a lot of heat.",
+                 bg=CARD, fg=MUTED, font=("Segoe UI", 8), anchor="w",
+                 justify="left", wraplength=520).pack(anchor="w", padx=(118, 0))
+        # Antivirus shield (Windows only): a quarantined fast engine silently drops
+        # you to the slow baseline build — the single biggest hashrate loss — so offer
+        # to exclude the engine folder from Windows Defender.
+        self.av_frame = tk.Frame(inner, bg=CARD)
+        self.av_frame.pack(anchor="w", padx=(118, 0), pady=(3, 0))
+        self.av_lbl = tk.Label(self.av_frame, text="", bg=CARD, fg=MUTED,
+                               font=("Segoe UI", 8), anchor="w", justify="left", wraplength=430)
+        self.av_lbl.pack(side="left")
+        self.av_btn = tk.Label(self.av_frame, text="", fg=ORANGE, bg=CARD, cursor="hand2",
+                               font=("Segoe UI", 8, "underline"))
+        self.av_btn.pack(side="left", padx=(6, 0))
+        self.av_btn.bind("<Button-1>", lambda _e: self._shield_av())
+        self._refresh_av_ui()
         self._on_pct()
         self._on_addr()
 
@@ -1140,25 +1197,46 @@ class MinerApp:
     # ---------- CPU load slider ----------
     def _on_pct(self, _value=None):
         pct = self.pct_var.get()
-        if not self.full_var.get() and pct > CPU_PCT_SOFT_MAX:
-            pct = CPU_PCT_SOFT_MAX
+        # hard cap: the slider tops out at 90%, but clamp anyway in case an older
+        # saved config or a stray value pushed it higher.
+        if pct > CPU_PCT_HARD_MAX:
+            pct = CPU_PCT_HARD_MAX
             self.pct_var.set(pct)
         t = threads_for(pct, self._ncpu)
-        # green while inside the recommended threshold, amber once above it
+        # green while inside the recommended threshold, amber above it (up to the cap)
         safe = pct <= CPU_PCT_SOFT_MAX
         tag = "✓ recommended" if safe else "⚠ high load"
         self.pct_lbl.config(text="%d%% · %d of %d threads · %s" % (pct, t, self._ncpu, tag),
                             fg=GREEN if safe else ORANGE)
 
-    def _on_full(self):
-        # ticking "Allow 100%" means use full power — jump the slider to 100 so
-        # the setting actually takes effect (previously it stayed at the 80 cap,
-        # so a checked box still mined at 80%). Unticking pulls back to the cap.
-        if self.full_var.get():
-            self.pct_var.set(100)
-        elif self.pct_var.get() > CPU_PCT_SOFT_MAX:
-            self.pct_var.set(CPU_PCT_SOFT_MAX)
-        self._on_pct()
+    # ---------- antivirus shield ----------
+    def _refresh_av_ui(self):
+        """Show the shield row only on Windows, and only nag when not yet excluded."""
+        present = av_exclusion_present()
+        if present is None:                 # not Windows / can't tell → hide entirely
+            self.av_frame.pack_forget()
+            return
+        if present:
+            self.av_lbl.config(text="🛡 Mining engine is shielded from antivirus ✓", fg=GREEN)
+            self.av_btn.config(text="")
+        else:
+            self.av_lbl.config(
+                text="🛡 Antivirus can quarantine the fast engine and drop you to the slow "
+                     "one — shield it so mining stays at full speed.", fg=ORANGE)
+            self.av_btn.config(text="Shield it")
+
+    def _shield_av(self):
+        if not self.av_btn.cget("text"):
+            return
+        if add_av_exclusion():
+            self._logln("Approve the Windows prompt to exclude the mining-engine folder "
+                        "from antivirus. Once it's added the fast engine won't be removed.",
+                        GREEN)
+            self.root.after(6000, self._refresh_av_ui)   # UAC is async → re-check shortly
+        else:
+            self._logln("Couldn't add the exclusion automatically. In Windows Security → "
+                        "Virus & threat protection → Manage settings → Exclusions, add this "
+                        "folder:\n%s" % engine_dir(), ORANGE)
 
     def _logln(self, text, color=None):
         self.log.configure(state="normal")
@@ -1227,18 +1305,18 @@ class MinerApp:
             self.addr_var.set(c.get("addr", ""))
             self.worker_var.set(c.get("worker", "pc"))
             if "cpu_pct" in c:
-                self.full_var.set(bool(c.get("full_cpu", False)))
-                self.pct_var.set(int(c["cpu_pct"]))
+                pct = int(c["cpu_pct"])
+                # migrate v1.7 and earlier: full_cpu=true (or any >90%) meant 100% —
+                # now hard-capped at 90%.
+                if c.get("full_cpu"):
+                    pct = CPU_PCT_HARD_MAX
             elif str(c.get("threads", "")).isdigit():
                 # pre-1.3.0 cfg stored a thread count — map it onto the slider
                 pct = int(round(int(c["threads"]) * 100.0 / self._ncpu))
-                pct = max(CPU_PCT_MIN, min(100, pct))
-                self.full_var.set(pct > CPU_PCT_SOFT_MAX)
-                self.pct_var.set(pct)
-            # apply the checkbox logic so a saved "Allow 100%" actually forces the
-            # slider to 100 on load (older builds could restore box=on but slider=80,
-            # leaving the miner stuck at 80% even though full load was requested)
-            self._on_full()
+            else:
+                pct = CPU_PCT_DEFAULT
+            self.pct_var.set(max(CPU_PCT_MIN, min(CPU_PCT_HARD_MAX, pct)))
+            self._on_pct()
         except Exception:
             pass
 
@@ -1247,8 +1325,7 @@ class MinerApp:
             with open(CFG_PATH, "w") as f:
                 json.dump({"addr": self.addr_var.get().strip(),
                            "worker": self.worker_var.get().strip(),
-                           "cpu_pct": self.pct_var.get(),
-                           "full_cpu": bool(self.full_var.get())}, f)
+                           "cpu_pct": self.pct_var.get()}, f)
         except Exception:
             pass
 
@@ -1277,12 +1354,10 @@ class MinerApp:
         addr = self.addr_var.get().strip()
         worker = re.sub(r"[^A-Za-z0-9_-]", "", self.worker_var.get().strip())
         host, port = DEFAULT_HOST, DEFAULT_PORT   # pool endpoint is fixed
-        self._on_pct()  # sync the label with the current slider/checkbox state
-        # the checkbox is the source of truth for full load: if "Allow 100%" is
-        # ticked we mine at 100% no matter what the slider reads, otherwise the
-        # slider value capped at the soft max. This guarantees a checked box can
-        # never mine at 80% regardless of how the cfg/slider got there.
-        eff_pct = 100 if self.full_var.get() else min(self.pct_var.get(), CPU_PCT_SOFT_MAX)
+        self._on_pct()  # sync the label with the current slider value
+        # the load is hard-capped at 90% — clamp here too so nothing (a stale cfg,
+        # a stray value) can ever push the miner above the cap.
+        eff_pct = min(self.pct_var.get(), CPU_PCT_HARD_MAX)
         threads = str(threads_for(eff_pct, self._ncpu))
 
         ok, detail = validate_btc_address(addr)

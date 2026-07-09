@@ -1,2 +1,2 @@
-5ea136ebbd8c61b4a2a4a4d5114754121fd3408a0086e4055edd2344a2dc37c6  SoloLuckMiner-v1.7.0.exe
-ade6c8daac620ef58c188a9bd61a790a2bd29489d6945674ac7a5b39a6df5b27  SoloLuckMiner-v1.7.0-src.zip
+ed951b50ad99ec18dece00406b550fe6a4dda5ad57acde3026e528d827d3d98c  SoloLuckMiner-v1.8.0.exe
+b18acee95d363f3232f0bbc2f5f072c359de139cc62eb9b079a026b2d46c3d8d  SoloLuckMiner-v1.8.0-src.zip
