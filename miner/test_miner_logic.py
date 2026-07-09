@@ -176,5 +176,108 @@ class TestIcon(unittest.TestCase):
         self.assertEqual(raw[:8], b"\x89PNG\r\n\x1a\n")
 
 
+class TestCpuSpec(unittest.TestCase):
+    def test_tier_of(self):
+        self.assertEqual(m.tier_of("cpuminer-avx512-sha-vaes.exe"), "AVX-512 + SHA")
+        self.assertEqual(m.tier_of("cpuminer-avx2-sha-vaes.exe"), "AVX2 + SHA")
+        self.assertEqual(m.tier_of("cpuminer-aes-sse42.exe"), "SSE4.2 + AES")
+        self.assertEqual(m.tier_of("cpuminer-sse2.exe"), "SSE2 (baseline)")
+        self.assertEqual(m.tier_of(""), "")
+
+    def test_cpu_spec_shape(self):
+        s = m.cpu_spec()
+        self.assertIn("brand", s)
+        self.assertGreaterEqual(s["logical"], 1)
+        self.assertIn("tier", s)
+        self.assertTrue(s["brand"])
+
+    def test_meter_graceful_offwindows(self):
+        # off-Windows sample() must never raise and returns None
+        self.assertIsNone(m.CpuMeter().sample())
+
+
+class TestVersionCompare(unittest.TestCase):
+    def test_ordering(self):
+        self.assertGreater(m._version_tuple("1.5.0"), m._version_tuple("1.4.0"))
+        self.assertGreater(m._version_tuple("1.10.0"), m._version_tuple("1.9.0"))
+        self.assertGreater(m._version_tuple("2.0.0"), m._version_tuple("1.99.99"))
+        self.assertEqual(m._version_tuple("1.5.0"), m._version_tuple("1.5.0"))
+
+    def test_garbage_versions_safe(self):
+        self.assertEqual(m._version_tuple("v1.5.0-beta"), (1, 5, 0))
+        self.assertEqual(m._version_tuple(""), (0,))
+
+
+class TestCheckForUpdate(unittest.TestCase):
+    def setUp(self):
+        self._orig = m._http_get
+
+    def tearDown(self):
+        m._http_get = self._orig
+
+    def _serve(self, obj):
+        m._http_get = lambda url, want_json=False, timeout=15: obj
+
+    def test_newer_offered(self):
+        self._serve({"version": "9.9.9", "file": "SoloLuckMiner-v9.9.9.exe", "sha256": "a" * 64})
+        info = m.check_for_update("1.5.0")
+        self.assertEqual(info["version"], "9.9.9")
+        self.assertTrue(info["url"].endswith("SoloLuckMiner-v9.9.9.exe"))
+
+    def test_same_or_older_declined(self):
+        self._serve({"version": "1.5.0", "file": "x.exe", "sha256": "a" * 64})
+        self.assertIsNone(m.check_for_update("1.5.0"))
+        self._serve({"version": "1.0.0", "file": "x.exe", "sha256": "a" * 64})
+        self.assertIsNone(m.check_for_update("1.5.0"))
+
+    def test_bad_sha_declined(self):
+        self._serve({"version": "9.9.9", "file": "x.exe", "sha256": "NOPE"})
+        self.assertIsNone(m.check_for_update("1.5.0"))
+
+    def test_missing_fields_declined(self):
+        self._serve({"version": "9.9.9"})
+        self.assertIsNone(m.check_for_update("1.5.0"))
+
+    def test_offline_declined(self):
+        def boom(*a, **k):
+            raise OSError("offline")
+        m._http_get = boom
+        self.assertIsNone(m.check_for_update("1.5.0"))
+
+
+class TestDownloadUpdate(unittest.TestCase):
+    def setUp(self):
+        self._orig_http = m._http_get
+        self._orig_dir = m._update_dir
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="slupd-")
+        m._update_dir = lambda: self.tmp
+
+    def tearDown(self):
+        m._http_get = self._orig_http
+        m._update_dir = self._orig_dir
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_verified_download_saved(self):
+        import hashlib
+        blob = b"MZ new-version-exe"
+        m._http_get = lambda url, timeout=300: blob
+        info = {"file": "SoloLuckMiner-v9.9.9.exe", "url": "https://x/f.exe",
+                "sha256": hashlib.sha256(blob).hexdigest()}
+        path = m.download_update(info)
+        self.assertTrue(path.endswith("SoloLuckMiner-v9.9.9.exe"))
+        self.assertEqual(open(path, "rb").read(), blob)
+
+    def test_tampered_download_fails_closed(self):
+        import hashlib, os as _os
+        m._http_get = lambda url, timeout=300: b"TAMPERED"
+        info = {"file": "u.exe", "url": "https://x/u.exe",
+                "sha256": hashlib.sha256(b"original").hexdigest()}
+        with self.assertRaisesRegex(RuntimeError, "SECURITY"):
+            m.download_update(info)
+        self.assertFalse(_os.path.exists(_os.path.join(self.tmp, "u.exe")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

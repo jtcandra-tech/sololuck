@@ -1,5 +1,18 @@
 # SoloLuck Miner — changelog
 
+## v1.5.0 — 2026-07-10
+- Auto-detected CPU panel: your processor name, core/thread count and the exact
+  cpuminer SIMD path it will use for mining (e.g. "AVX-512 + SHA" on modern AMD,
+  "AVX2 + SHA" on 12th-gen Intel) — shown the moment the app opens.
+- Live per-core load meter: a bar per logical core so you can see exactly which
+  cores the miner is driving, with an "N of M cores active" count.
+- CPU-load slider now shows a green "recommended" threshold (up to 80%) that
+  turns amber once you opt into higher, hotter loads.
+- Built-in auto-update: the app checks sololuck.io on launch and, if a newer
+  version exists, shows a banner. Updating downloads the new versioned build,
+  verifies its SHA-256 against the site manifest (fail-closed), and relaunches.
+- UI polish throughout.
+
 ## v1.4.0 — 2026-07-10
 - Real Bitcoin address verification with a live indicator: base58check for
   legacy/P2SH and BIP-173/BIP-350 bech32(m) for bc1q/bc1p, checked as you

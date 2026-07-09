@@ -42,7 +42,7 @@ DEFAULT_HOST = "sololuck.io"
 DEFAULT_PORT = "3335"   # Nano tier — diff 1, tuned for CPUs so shares register fast
 ALGO = "sha256d"   # Bitcoin
 ENGINE_DIR_NAME = "SoloLuckMiner-engine"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 CHANGELOG_URL = "https://sololuck.io/changelog"
 # The pool endpoint is fixed: this is the SoloLuck app, and the Nano tier's
 # difficulty is what makes CPU shares register fast. (Generic pools have
@@ -367,6 +367,205 @@ def preferred_builds():
     return out
 
 
+# ── CPU identity (for the spec readout) ───────────────────────────────────────
+def tier_of(build_name):
+    """Human name for the SIMD path a cpuminer build uses (drives per-core speed)."""
+    n = (build_name or "").lower()
+    if "avx512-sha" in n:
+        return "AVX-512 + SHA"
+    if "avx512" in n:
+        return "AVX-512"
+    if "avx2-sha" in n:
+        return "AVX2 + SHA"
+    if "avx2" in n:
+        return "AVX2"
+    if "avx" in n:
+        return "AVX"
+    if "aes-sse42" in n or "sse42" in n:
+        return "SSE4.2 + AES"
+    if "sse2" in n:
+        return "SSE2 (baseline)"
+    return ""
+
+
+def cpu_brand():
+    """Marketing name of the CPU (e.g. 'AMD Ryzen 7 9800X3D'). CPUID brand string
+    on Windows; falls back to platform/env. Never raises."""
+    if os.name == "nt":
+        try:
+            if _cpuid(0x80000000)[0] >= 0x80000004:
+                buf = b""
+                for leaf in (0x80000002, 0x80000003, 0x80000004):
+                    for reg in _cpuid(leaf):
+                        buf += int(reg).to_bytes(4, "little")
+                s = buf.split(b"\x00")[0].decode("ascii", "replace").strip()
+                if s:
+                    return " ".join(s.split())  # collapse the padding spaces
+        except Exception:
+            pass
+    try:
+        import platform
+        return platform.processor() or os.environ.get("PROCESSOR_IDENTIFIER", "CPU")
+    except Exception:
+        return "CPU"
+
+
+def physical_cores():
+    """Physical core count via GetLogicalProcessorInformation (Win64). None if
+    unknown — the caller shows logical threads instead."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        class _SLPI(ctypes.Structure):
+            _fields_ = [("mask", ctypes.c_size_t),
+                        ("relationship", ctypes.c_uint32),
+                        ("_pad", ctypes.c_ubyte * 20)]
+        k = ctypes.windll.kernel32
+        rl = ctypes.c_uint32(0)
+        k.GetLogicalProcessorInformation(None, ctypes.byref(rl))  # sizing call
+        n = rl.value // ctypes.sizeof(_SLPI)
+        if n <= 0:
+            return None
+        arr = (_SLPI * n)()
+        if not k.GetLogicalProcessorInformation(arr, ctypes.byref(rl)):
+            return None
+        cores = sum(1 for x in arr if x.relationship == 0)  # RelationProcessorCore
+        return cores or None
+    except Exception:
+        return None
+
+
+def cpu_spec():
+    """{brand, physical, logical, tier, build} — everything the spec line shows."""
+    logical = os.cpu_count() or 1
+    builds = preferred_builds()
+    build = builds[0] if builds else ""
+    return {"brand": cpu_brand(), "physical": physical_cores(),
+            "logical": logical, "tier": tier_of(build), "build": build}
+
+
+class CpuMeter:
+    """Per-logical-core busy% from NtQuerySystemInformation (Win64, no deps).
+    sample() returns a list of 0-100 ints (one per logical CPU) or None."""
+    _SPPI = 8  # SystemProcessorPerformanceInformation
+
+    def __init__(self):
+        self.n = os.cpu_count() or 1
+        self._prev = None
+        self._ok = os.name == "nt"
+        if self._ok:
+            try:
+                import ctypes
+
+                class _PI(ctypes.Structure):
+                    _fields_ = [("Idle", ctypes.c_int64), ("Kernel", ctypes.c_int64),
+                                ("User", ctypes.c_int64), ("Dpc", ctypes.c_int64),
+                                ("Int", ctypes.c_int64), ("IntCount", ctypes.c_uint32)]
+                self._PI = _PI
+                self._ntdll = ctypes.windll.ntdll
+                self._ctypes = ctypes
+            except Exception:
+                self._ok = False
+
+    def _read(self):
+        c = self._ctypes
+        arr = (self._PI * self.n)()
+        ret = c.c_uint32(0)
+        st = self._ntdll.NtQuerySystemInformation(self._SPPI, arr, c.sizeof(arr), c.byref(ret))
+        if st != 0:
+            return None
+        return [(p.Idle, p.Kernel, p.User) for p in arr]
+
+    def sample(self):
+        if not self._ok:
+            return None
+        try:
+            cur = self._read()
+        except Exception:
+            self._ok = False
+            return None
+        if not cur:
+            return None
+        out, prev = None, self._prev
+        if prev and len(prev) == len(cur):
+            out = []
+            for (i0, k0, u0), (i1, k1, u1) in zip(prev, cur):
+                total = (k1 - k0) + (u1 - u0)   # KernelTime includes idle
+                idle = i1 - i0
+                busy = 0 if total <= 0 else max(0.0, min(1.0, (total - idle) / total))
+                out.append(int(round(busy * 100)))
+        self._prev = cur
+        return out
+
+
+# ── auto-update (check sololuck.io, verify the new exe's SHA-256, relaunch) ────
+LATEST_URL = "https://sololuck.io/miner-latest.json"
+
+
+def _version_tuple(s):
+    out = []
+    for part in str(s).split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out) or (0,)
+
+
+def check_for_update(current=APP_VERSION):
+    """Ask the site for the latest version. Returns the release dict
+    {version,file,url,sha256} only if it is strictly newer than `current`,
+    else None. Never raises (offline / blocked → None)."""
+    try:
+        info = _http_get(LATEST_URL, want_json=True, timeout=15)
+    except Exception:
+        return None
+    if not isinstance(info, dict) or "version" not in info:
+        return None
+    if _version_tuple(info["version"]) <= _version_tuple(current):
+        return None
+    url = info.get("url") or ("https://sololuck.io/" + info.get("file", ""))
+    sha = (info.get("sha256") or "").lower()
+    if not (info.get("file") and re.fullmatch(r"[0-9a-f]{64}", sha)):
+        return None
+    info["url"] = url
+    return info
+
+
+def _update_dir():
+    """A writable folder to drop the new exe in (prefer next to the current app)."""
+    for base in (app_dir(), os.environ.get("USERPROFILE", ""), os.environ.get("TEMP", "")):
+        if not base:
+            continue
+        try:
+            t = os.path.join(base, ".sl_wtest")
+            with open(t, "w"):
+                pass
+            os.remove(t)
+            return base
+        except Exception:
+            continue
+    return app_dir()
+
+
+def download_update(info, report=lambda s: None):
+    """Fetch the newer versioned exe, verify its SHA-256 against the manifest
+    (fail closed), and return the local path. No overwrite of the running exe —
+    the file is versioned, so the new one just sits beside the old."""
+    dest = os.path.join(_update_dir(), info["file"])
+    report("Downloading %s…" % info["file"])
+    blob = _http_get(info["url"], timeout=300)
+    got = hashlib.sha256(blob).hexdigest()
+    if got != info["sha256"].lower():
+        raise RuntimeError("SECURITY: the downloaded update does not match the "
+                           "published SHA-256.\nExpected %s\nGot      %s\nNothing was saved."
+                           % (info["sha256"], got))
+    with open(dest, "wb") as f:
+        f.write(blob)
+    report("Update verified — SHA-256 OK.")
+    return dest
+
+
 # ── engine location (a stable, antivirus-excludable folder next to the app) ───
 def engine_dir():
     """A stable, writable folder to keep the downloaded engine in (so the path
@@ -602,6 +801,11 @@ class MinerApp:
         self._fellback = False          # one automatic retry on the sse2 build per session
         self._user_engine_choice = None  # remembered answer for an unverified user engine
         self._cur_addr = ""
+        self._spec = cpu_spec()
+        self.meter_src = CpuMeter()
+        self._last_cores = None
+        self._last_meter_ts = 0
+        self._update_info = None
         root.title("%s v%s · engine cpuminer-opt %s" % (APP_NAME, APP_VERSION, ENGINE_VERSION))
         root.configure(bg=BG)
         root.minsize(560, 580)
@@ -615,6 +819,7 @@ class MinerApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(200, self._pump)
         threading.Thread(target=self._init_engine, daemon=True).start()
+        threading.Thread(target=self._check_update, daemon=True).start()
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -625,6 +830,23 @@ class MinerApp:
                  font=("Segoe UI", 20, "bold")).pack()
         tk.Label(head, text="Miner — CPU solo mining to sololuck.io", fg=MUTED, bg=BG,
                  font=("Segoe UI", 10)).pack()
+
+        # update banner — created hidden, shown when a newer version is found
+        self.update_bar = tk.Frame(self.root, bg="#132015", highlightbackground=GREEN,
+                                   highlightthickness=1)
+        self.update_lbl = tk.Label(self.update_bar, text="", bg="#132015", fg=GREEN,
+                                   font=("Segoe UI", 9, "bold"))
+        self.update_lbl.pack(side="left", padx=(12, 8), pady=6)
+        self.update_btn = tk.Button(self.update_bar, text="Update now", command=self._do_update,
+                                    bg=GREEN, fg="#08120b", relief="flat", cursor="hand2",
+                                    font=("Segoe UI", 9, "bold"), padx=12, pady=3)
+        self.update_btn.pack(side="right", padx=(0, 10), pady=5)
+        _wc = tk.Label(self.update_bar, text="What changed ↗", bg="#132015", fg=MUTED,
+                       cursor="hand2", font=("Segoe UI", 8, "underline"))
+        _wc.pack(side="right", padx=8)
+        _wc.bind("<Button-1>", lambda _e: webbrowser.open(CHANGELOG_URL))
+
+        self._build_cpu_card()
 
         form = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER,
                         highlightthickness=1, bd=0)
@@ -673,10 +895,10 @@ class MinerApp:
                                   activebackground=ORANGE_HOT, highlightthickness=0,
                                   bd=0, relief="flat", sliderrelief="flat",
                                   sliderlength=22, width=10)
-        self.pct_scale.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        self.pct_lbl = tk.Label(ldf, text="", fg=FG, bg=CARD, width=22, anchor="w",
+        self.pct_scale.pack(side="left", fill="x", expand=True, padx=(0, 0))
+        self.pct_lbl = tk.Label(inner, text="", bg=CARD, anchor="w",
                                 font=("Segoe UI", 9, "bold"))
-        self.pct_lbl.pack(side="left")
+        self.pct_lbl.pack(anchor="w", padx=(118, 0))
         self.full_var = tk.BooleanVar(value=False)
         self.full_chk = tk.Checkbutton(
             inner, variable=self.full_var, command=self._on_full,
@@ -761,6 +983,74 @@ class MinerApp:
         wn.pack(side="right")
         wn.bind("<Button-1>", lambda _e: webbrowser.open(CHANGELOG_URL))
 
+    # ---------- CPU spec card + live per-core meter ----------
+    def _build_cpu_card(self):
+        spec = self._spec
+        card = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER,
+                        highlightthickness=1, bd=0)
+        card.pack(fill="x", padx=14, pady=6)
+        inner = tk.Frame(card, bg=CARD)
+        inner.pack(fill="x", padx=12, pady=10)
+
+        top = tk.Frame(inner, bg=CARD)
+        top.pack(fill="x")
+        tk.Label(top, text="🖥", bg=CARD, font=("Segoe UI", 15)).pack(side="left", padx=(0, 8))
+        nm = tk.Frame(top, bg=CARD)
+        nm.pack(side="left", fill="x", expand=True)
+        tk.Label(nm, text=spec["brand"], fg=FG, bg=CARD, anchor="w",
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        cores = ("%d cores · %d threads" % (spec["physical"], spec["logical"])
+                 if spec["physical"] else "%d threads" % spec["logical"])
+        sub = cores + (("  ·  mining path: " + spec["tier"]) if spec["tier"] else "")
+        tk.Label(nm, text=sub, fg=MUTED, bg=CARD, anchor="w",
+                 font=("Segoe UI", 8)).pack(anchor="w")
+
+        row = tk.Frame(inner, bg=CARD)
+        row.pack(fill="x", pady=(8, 0))
+        tk.Label(row, text="Per-core load", fg=MUTED, bg=CARD,
+                 font=("Segoe UI", 8)).pack(side="left")
+        self.core_count_lbl = tk.Label(row, text="", fg=MUTED, bg=CARD,
+                                       font=("Segoe UI", 8))
+        self.core_count_lbl.pack(side="right")
+        self.meter = tk.Canvas(inner, height=34, bg=BG, highlightthickness=1,
+                               highlightbackground=BORDER, bd=0)
+        self.meter.pack(fill="x", pady=(3, 0))
+        self.meter.bind("<Configure>", lambda _e: self._draw_meter(self._last_cores))
+        self.meter.bind("<Enter>", lambda _e: None)
+
+    def _draw_meter(self, pcts):
+        c = self.meter
+        c.delete("all")
+        w = c.winfo_width() or 1
+        h = c.winfo_height() or 34
+        n = self._spec["logical"]
+        if not pcts:
+            c.create_text(w // 2, h // 2, text="waiting for CPU data…" if os.name == "nt"
+                          else "per-core view is Windows-only",
+                          fill=MUTED, font=("Segoe UI", 8))
+            return
+        pad, gap = 4, 2
+        bw = max(2.0, (w - 2 * pad - gap * (n - 1)) / n)
+        active = 0
+        for i, p in enumerate(pcts[:n]):
+            x0 = pad + i * (bw + gap)
+            x1 = x0 + bw
+            c.create_rectangle(x0, pad, x1, h - pad, fill="#0f141c", outline="")
+            fh = (h - 2 * pad) * (p / 100.0)
+            # a busy core is GREEN (it's earning); idle cores stay dim
+            if p >= 15:
+                active += 1
+            col = "#243040" if p < 12 else GREEN
+            if fh > 0:
+                c.create_rectangle(x0, h - pad - fh, x1, h - pad, fill=col, outline="")
+        self.core_count_lbl.config(text="%d of %d cores active" % (active, n))
+
+    def _update_meter(self):
+        pcts = self.meter_src.sample() if self.meter_src else None
+        if pcts:
+            self._last_cores = pcts
+            self._draw_meter(pcts)
+
     def _on_addr(self):
         a = self.addr_var.get().strip()
         if not a:
@@ -777,6 +1067,32 @@ class MinerApp:
         if self._cur_addr:
             webbrowser.open("https://sololuck.io/users/%s" % self._cur_addr)
 
+    # ---------- auto-update ----------
+    def _check_update(self):
+        info = check_for_update()
+        if info:
+            self.q.put(("__UPDATE__", info))
+
+    def _do_update(self):
+        """Download the newer versioned exe, verify it, launch it, and close.
+        Source runs (not frozen) just open the download page."""
+        info = self._update_info
+        if not info:
+            return
+        if not getattr(sys, "frozen", False):
+            webbrowser.open("https://sololuck.io/setup")
+            return
+        self.update_btn.config(state="disabled", text="Updating…")
+        threading.Thread(target=self._run_update, args=(info,), daemon=True).start()
+
+    def _run_update(self, info):
+        try:
+            path = download_update(info, lambda s: self.q.put(("__ENGMSG__", s)))
+        except Exception as e:
+            self.q.put(("__UPDERR__", str(e)))
+            return
+        self.q.put(("__UPDREADY__", path))
+
     # ---------- CPU load slider ----------
     def _on_pct(self, _value=None):
         pct = self.pct_var.get()
@@ -784,8 +1100,11 @@ class MinerApp:
             pct = CPU_PCT_SOFT_MAX
             self.pct_var.set(pct)
         t = threads_for(pct, self._ncpu)
-        self.pct_lbl.config(text="%d%% · %d of %d threads" % (pct, t, self._ncpu),
-                            fg=ORANGE if pct > CPU_PCT_SOFT_MAX else FG)
+        # green while inside the recommended threshold, amber once above it
+        safe = pct <= CPU_PCT_SOFT_MAX
+        tag = "✓ recommended" if safe else "⚠ high load"
+        self.pct_lbl.config(text="%d%% · %d of %d threads · %s" % (pct, t, self._ncpu, tag),
+                            fg=GREEN if safe else ORANGE)
 
     def _on_full(self):
         if not self.full_var.get() and self.pct_var.get() > CPU_PCT_SOFT_MAX:
@@ -1027,6 +1346,10 @@ class MinerApp:
             self.time_lbl.config(text="⏱ %d:%02d:%02d" % (s // 3600, s % 3600 // 60, s % 60))
         elif self.time_lbl.cget("text"):
             self.time_lbl.config(text="")
+        now = time.time()
+        if now - self._last_meter_ts >= 1.0:   # CPU% needs a ~1s delta window
+            self._last_meter_ts = now
+            self._update_meter()
         self.root.after(200, self._pump)
 
     def _handle_event(self, item):
@@ -1059,6 +1382,27 @@ class MinerApp:
             _verify_log("user-supplied engine %s unverified -> %s"
                         % (item[1], "user accepted" if self._user_engine_choice else "refused"))
             threading.Thread(target=self._init_engine, daemon=True).start()
+        elif kind == "__UPDATE__":
+            self._update_info = item[1]
+            self.update_lbl.config(text="⬆ SoloLuck Miner v%s is available" % item[1]["version"])
+            self.update_bar.pack(fill="x", padx=14, pady=(0, 4),
+                                 after=self.root.winfo_children()[0])
+            self._logln("A newer version (v%s) is available — click Update in the banner."
+                        % item[1]["version"], GREEN)
+        elif kind == "__UPDREADY__":
+            self._logln("Update downloaded and verified. Restarting into the new version…", GREEN)
+            try:
+                subprocess.Popen([item[1]], cwd=os.path.dirname(item[1]) or None)
+                self.root.after(400, self.on_close)
+            except Exception as e:
+                self.update_btn.config(state="normal", text="Update now")
+                messagebox.showerror(APP_NAME, "Couldn't launch the update:\n%s\n\n"
+                                     "You can download it from sololuck.io/setup." % e)
+        elif kind == "__UPDERR__":
+            self.update_btn.config(state="normal", text="Update now")
+            self._logln("Update failed: %s" % item[1], RED)
+            messagebox.showerror(APP_NAME, "The update could not be verified or downloaded:\n\n%s\n\n"
+                                 "Get it manually from sololuck.io/setup." % item[1])
 
     def _try_sse2_fallback(self, code):
         """A too-new build crashing on launch (illegal instruction) auto-retries
@@ -1215,9 +1559,38 @@ def _minetest(seconds, addr, threads):
         pass
 
 
+def _cpuinfo():
+    """Headless dump of what the spec card would show + a per-core meter sample.
+    Usage: SoloLuckMiner.exe --cpuinfo"""
+    out = os.path.join(app_dir(), "sololuck_cpuinfo.txt")
+    lines = []
+    def w(s):
+        lines.append(str(s)); print(s)
+    sp = cpu_spec()
+    w("brand: %s" % sp["brand"])
+    w("physical_cores: %s" % sp["physical"])
+    w("logical_threads: %s" % sp["logical"])
+    w("mining_path: %s (%s)" % (sp["tier"], sp["build"]))
+    w("features: %s" % cpu_features())
+    m = CpuMeter()
+    m.sample(); time.sleep(1.0)
+    pcts = m.sample()
+    w("per_core_sample: %s" % pcts)
+    w("update_check: %s" % (check_for_update() or "none/uptodate"))
+    ok = bool(sp["brand"] and sp["logical"] >= 1 and sp["tier"])
+    w("RESULT: %s" % ("PASS" if ok else "FAIL"))
+    try:
+        open(out, "w").write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+
+
 def main():
     if "--selftest" in sys.argv:
         _selftest()
+        return
+    if "--cpuinfo" in sys.argv:
+        _cpuinfo()
         return
     if "--minetest" in sys.argv:
         i = sys.argv.index("--minetest")
