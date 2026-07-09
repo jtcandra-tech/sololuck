@@ -19,14 +19,18 @@ retries with the universal SSE2 build.
 ## Use it (2 steps)
 
 ### 1. Run it
-Grab **`SoloLuckMiner.exe`** from https://sololuck.io and run it. On first launch it
-downloads the engine (~18 MB, one time) — you'll see "Downloading the mining engine…".
+Grab the latest **`SoloLuckMiner-v1.4.0.exe`** from https://sololuck.io and run it. On
+first launch it downloads the engine (~18 MB, one time) — you'll see "Downloading the
+mining engine…".
 
 ### 2. Fill in and Start
 - **BTC payout address** — where the block reward goes (your wallet). In solo mode the
-  address *is* your login.
+  address *is* your login. The app checks it live: a green **✓** means the checksum is
+  a real Bitcoin address (legacy, SegWit and Taproot all fine).
 - **Worker name** — anything (e.g. `pc`).
-- **Pool host** `sololuck.io`, **Port** stays on `3335` (Nano) for CPUs.
+- The pool endpoint is **fixed** to `sololuck.io:3335` (Nano tier — its low starting
+  difficulty is what makes CPU shares register fast).
+- Pick a **CPU load** (starts gentle at 25%; 100% is opt-in and will slow your PC).
 - Click **Start Mining**. The selected engine shows under the stats.
 
 ---

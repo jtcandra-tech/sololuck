@@ -1,9 +1,9 @@
 {
   "app": "SoloLuck Miner",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "release_date": "2026-07-10",
-  "source_zip": "SoloLuckMiner-v1.3.0-source.zip",
-  "source_zip_sha256": "3901e74b393fc04c6d874879a91f6e910ca35da1a3b98e2967d2f9b4eb0d8bad",
+  "source_zip": "SoloLuckMiner-v1.4.0-src.zip",
+  "source_zip_sha256": "b1d5d52554160ac909c50d8865d3353b5c33841800e3876068724cb6ab985afb",
   "license": "see README.md; bundled engine cpuminer-opt is GPLv2",
   "engine": {
     "name": "cpuminer-opt",
@@ -13,9 +13,9 @@
     "archive_sha256": "caf59deb12831e40475c5245a76bf42f9ba2ff620065be5386b80ec55c998e9c"
   },
   "exe": {
-    "file": "SoloLuckMiner-v1.3.0.exe",
-    "sha256": "0a0f234b5cd39757302803c48990e097bbee7f405810f1173e0d3f2be76f1ea8",
-    "size": 11108013,
+    "file": "SoloLuckMiner-v1.4.0.exe",
+    "sha256": "947ad0ff36924384320e468275e7aba96e7c6cd55a7409d6960aece670e1e306",
+    "size": 11110690,
     "built_on": "cg001 (Windows 11, Python 3.12.7, PyInstaller 6.21.0)",
     "status": "RELEASED"
   }

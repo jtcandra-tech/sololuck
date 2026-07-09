@@ -94,6 +94,43 @@ class TestPreferredBuilds(unittest.TestCase):
         self.assertEqual(got[0], "cpuminer-avx2-sha-vaes.exe")
 
 
+class TestValidateBtcAddress(unittest.TestCase):
+    VALID = [
+        ("bc1q9t8v8e29xhhxlj3tt5ulj4dxal8ud3wreessha", "SegWit bc1q"),
+        ("BC1Q9T8V8E29XHHXLJ3TT5ULJ4DXAL8UD3WREESSHA", "SegWit bc1q"),  # all-upper QR form
+        ("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", "legacy P2PKH"),         # genesis block
+        ("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", "P2SH"),
+        ("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", "SegWit bc1q"),  # BIP-173 vector
+    ]
+    INVALID = [
+        ("bc1q9t8v8e29xhhxlj3tt5ulj4dxal8ud3wreesshq", "checksum"),   # in-charset flip
+        ("bc1q9t8v8e29xhhxlj3tt5ulj4dxal8ud3wreesshb", "character"),  # out-of-charset char
+        ("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb", "checksum"),
+        ("bc1Q9t8v8e29xhhxlj3tt5ulj4dxal8ud3wreessha", "mixed"),
+        ("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", "mainnet"),    # testnet bech32
+        ("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn", "mainnet"),            # testnet legacy
+        ("0x7C3Aa9f0aD8a9C0f9534eE55E4B4Cc3E29a3F1b0", "Ethereum"),
+        ("hello", ""), ("", ""),
+        ("bc1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq", ""),
+    ]
+
+    def test_valid_addresses(self):
+        for a, kind in self.VALID:
+            ok, detail = m.validate_btc_address(a)
+            self.assertTrue(ok, (a, detail))
+            self.assertIn(kind.lower(), detail.lower(), a)
+
+    def test_invalid_addresses(self):
+        for a, why in self.INVALID:
+            ok, detail = m.validate_btc_address(a)
+            self.assertFalse(ok, (a, detail))
+            self.assertIn(why.lower(), detail.lower(), a)
+
+    def test_whitespace_tolerated(self):
+        self.assertTrue(m.validate_btc_address(
+            "  bc1q9t8v8e29xhhxlj3tt5ulj4dxal8ud3wreessha \n")[0])
+
+
 class TestThreadsFor(unittest.TestCase):
     def test_quarter_load_defaults(self):
         self.assertEqual(m.threads_for(25, 12), 3)

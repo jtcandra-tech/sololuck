@@ -1,5 +1,20 @@
 # SoloLuck Miner — changelog
 
+## v1.4.0 — 2026-07-10
+- Real Bitcoin address verification with a live indicator: base58check for
+  legacy/P2SH and BIP-173/BIP-350 bech32(m) for bc1q/bc1p, checked as you
+  type — a green ✓ names the address kind; a red ✗ tells you why it's wrong
+  (typo/checksum, testnet, even a pasted Ethereum address). Start refuses
+  anything that fails the checksum, because on a solo pool a mistyped payout
+  address means an unclaimable block.
+- Pool host and port are now fixed to sololuck.io:3335 (Nano tier). The app
+  has one job; removing the editable fields removes the ways to break it.
+- The app shows its version with a "What's new" link to sololuck.io/changelog.
+- Release files are versioned: SoloLuckMiner-v1.4.0.exe / -src.zip (old
+  unversioned URLs redirect).
+- UI polish: card-style form with focus rings on inputs, bordered stat tiles,
+  button hover states, tidier spacing.
+
 ## v1.3.0 — 2026-07-10
 - CPU load is now a slider, not a thread count. It starts gentle at 25% of
   your cores and tops out at 80%; the thread math is done for you

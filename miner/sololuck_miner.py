@@ -42,7 +42,12 @@ DEFAULT_HOST = "sololuck.io"
 DEFAULT_PORT = "3335"   # Nano tier — diff 1, tuned for CPUs so shares register fast
 ALGO = "sha256d"   # Bitcoin
 ENGINE_DIR_NAME = "SoloLuckMiner-engine"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
+CHANGELOG_URL = "https://sololuck.io/changelog"
+# The pool endpoint is fixed: this is the SoloLuck app, and the Nano tier's
+# difficulty is what makes CPU shares register fast. (Generic pools have
+# generic miners; this one has one job.)
+POOL_LABEL = "stratum+tcp://%s:%s" % (DEFAULT_HOST, DEFAULT_PORT)
 # CPU load slider: gentle by default. Full load makes a PC noticeably slower,
 # so 100% is opt-in via an explicit checkbox; without it the slider tops out
 # at the soft max.
@@ -84,7 +89,6 @@ MINER_NAMES = [
     "cpuminer-sse2.exe", "cpuminer-sse42.exe", "cpuminer-aes-sse42.exe",
     "cpuminer-opt", "cpuminer",   # non-Windows dev fallbacks
 ]
-ADDR_RE = re.compile(r"^(bc1[a-z0-9]{20,90}|[13][a-km-zA-HJ-NP-Z1-9]{20,40})$")
 HASH_RE = re.compile(r"([\d.]+)\s*([kKMGTP]?)[hH]/s")
 ACCEPT_RE = re.compile(r"[Aa]ccepted\s+(\d+)/(\d+)")
 # connection-state classification of cpuminer output lines (order matters:
@@ -141,14 +145,106 @@ def threads_for(pct, ncpu):
     pct = max(CPU_PCT_MIN, min(100, pct))
     return max(1, int(round((ncpu or 1) * pct / 100.0)))
 
+
+# ── Bitcoin address validation (real checksums, not just shape) ───────────────
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_B32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+
+def _bech32_polymod(values):
+    gen = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
+    chk = 1
+    for v in values:
+        b = chk >> 25
+        chk = ((chk & 0x1FFFFFF) << 5) ^ v
+        for i in range(5):
+            if (b >> i) & 1:
+                chk ^= gen[i]
+    return chk
+
+
+def validate_btc_address(addr):
+    """(ok, detail): base58check for 1…/3…, BIP-173/BIP-350 bech32(m) for bc1….
+    detail = the address kind when valid, else why it failed. Mainnet only —
+    a mistyped payout address on a solo pool means an unclaimable block."""
+    a = (addr or "").strip()
+    if not a:
+        return (False, "empty")
+    low = a.lower()
+    if low.startswith(("tb1", "bcrt1")) or a[0] in "mn2" or a[:2] == "0x":
+        return (False, "not a mainnet Bitcoin address" if a[:2] != "0x"
+                else "that looks like an Ethereum address")
+    if len(a) < 14:
+        return (False, "too short")
+    if a[0] in "13":
+        n = 0
+        for ch in a:
+            i = _B58_ALPHABET.find(ch)
+            if i < 0:
+                return (False, "invalid character '%s'" % ch)
+            n = n * 58 + i
+        raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        raw = b"\x00" * (len(a) - len(a.lstrip("1"))) + raw
+        if len(raw) != 25:
+            return (False, "wrong length")
+        if hashlib.sha256(hashlib.sha256(raw[:21]).digest()).digest()[:4] != raw[21:]:
+            return (False, "checksum failed — typo?")
+        return (True, "legacy P2PKH" if raw[0] == 0x00 else "P2SH")
+    if low.startswith("bc1"):
+        if a != low and a != a.upper():
+            return (False, "mixed upper/lower case")
+        sep = low.rfind("1")
+        if low[:sep] != "bc":
+            return (False, "unrecognized format")
+        vals = []
+        for ch in low[sep + 1:]:
+            i = _B32_CHARSET.find(ch)
+            if i < 0:
+                return (False, "invalid character '%s'" % ch)
+            vals.append(i)
+        if len(vals) < 7:
+            return (False, "too short")
+        hrpexp = [ord(c) >> 5 for c in "bc"] + [0] + [ord(c) & 31 for c in "bc"]
+        witver = vals[0]
+        if witver > 16:
+            return (False, "bad witness version")
+        want = 1 if witver == 0 else 0x2BC830A3   # bech32 v0, bech32m v1+
+        if _bech32_polymod(hrpexp + vals) != want:
+            return (False, "checksum failed — typo?")
+        acc = bits = 0
+        prog = []
+        for v in vals[1:-6]:
+            acc = (acc << 5) | v
+            bits += 5
+            while bits >= 8:
+                bits -= 8
+                prog.append((acc >> bits) & 0xFF)
+        if bits >= 5 or (acc & ((1 << bits) - 1)):
+            return (False, "invalid padding")
+        n = len(prog)
+        if witver == 0:
+            if n == 20:
+                return (True, "SegWit bc1q")
+            if n == 32:
+                return (True, "SegWit bc1q (script)")
+            return (False, "wrong program length")
+        if not 2 <= n <= 40:
+            return (False, "wrong program length")
+        if witver == 1 and n == 32:
+            return (True, "Taproot bc1p")
+        return (True, "SegWit v%d" % witver)
+    return (False, "unrecognized format")
+
 # colours (brand-ish, works on the default tk theme)
 BG = "#0b0e14"
 CARD = "#11161f"
 FG = "#dfe6f0"
 MUTED = "#9fb0c5"
 ORANGE = "#f7931a"
+ORANGE_HOT = "#ffa733"
 GREEN = "#3ad17a"
 RED = "#ff6b6b"
+BORDER = "#1c2534"
 
 # 32×32 window icon (orange rounded square + bolt), PNG, generated at build time
 ICON_B64 = ("iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAABCklEQVR42tWXsQ3CMBBF0yNRESBI"
@@ -530,64 +626,86 @@ class MinerApp:
         tk.Label(head, text="Miner — CPU solo mining to sololuck.io", fg=MUTED, bg=BG,
                  font=("Segoe UI", 10)).pack()
 
-        form = tk.Frame(self.root, bg=BG)
-        form.pack(fill="x", **pad)
+        form = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER,
+                        highlightthickness=1, bd=0)
+        form.pack(fill="x", padx=14, pady=6)
+        inner = tk.Frame(form, bg=CARD)
+        inner.pack(fill="x", padx=12, pady=10)
 
-        def row(label, default="", show=None, width=44):
-            fr = tk.Frame(form, bg=BG)
+        def row(label, default=""):
+            fr = tk.Frame(inner, bg=CARD)
             fr.pack(fill="x", pady=3)
-            tk.Label(fr, text=label, fg=MUTED, bg=BG, width=18, anchor="w",
+            tk.Label(fr, text=label, fg=MUTED, bg=CARD, width=18, anchor="w",
                      font=("Segoe UI", 9)).pack(side="left")
             var = tk.StringVar(value=default)
-            ent = tk.Entry(fr, textvariable=var, bg=CARD, fg=FG, insertbackground=FG,
-                           relief="flat", width=width, font=("Consolas", 10))
-            if show:
-                ent.config(show=show)
+            ent = tk.Entry(fr, textvariable=var, bg=BG, fg=FG, insertbackground=FG,
+                           relief="flat", font=("Consolas", 10),
+                           highlightthickness=1, highlightbackground=BORDER,
+                           highlightcolor=ORANGE)
             ent.pack(side="left", fill="x", expand=True, ipady=4)
             return var, ent
 
         self.addr_var, _ = row("BTC payout address", "")
+        self.addr_status = tk.Label(inner, text="", fg=MUTED, bg=CARD, anchor="w",
+                                    font=("Segoe UI", 8))
+        self.addr_status.pack(fill="x", padx=(122, 0))
+        self.addr_var.trace_add("write", lambda *_a: self._on_addr())
         self.worker_var, _ = row("Worker name", "pc")
-        self.host_var, _ = row("Pool host", DEFAULT_HOST)
-        self.port_var, _ = row("Port", DEFAULT_PORT)
+
+        pf = tk.Frame(inner, bg=CARD)
+        pf.pack(fill="x", pady=3)
+        tk.Label(pf, text="Pool", fg=MUTED, bg=CARD, width=18, anchor="w",
+                 font=("Segoe UI", 9)).pack(side="left")
+        tk.Label(pf, text=POOL_LABEL, fg=FG, bg=CARD, anchor="w",
+                 font=("Consolas", 10)).pack(side="left", ipady=4)
+        tk.Label(pf, text="  🔒 Nano tier · fixed", fg=MUTED, bg=CARD,
+                 font=("Segoe UI", 8)).pack(side="left")
+
         self._ncpu = os.cpu_count() or 1
-        ldf = tk.Frame(form, bg=BG)
+        ldf = tk.Frame(inner, bg=CARD)
         ldf.pack(fill="x", pady=(8, 0))
-        tk.Label(ldf, text="CPU load", fg=MUTED, bg=BG, width=18, anchor="w",
+        tk.Label(ldf, text="CPU load", fg=MUTED, bg=CARD, width=18, anchor="w",
                  font=("Segoe UI", 9)).pack(side="left")
         self.pct_var = tk.IntVar(value=CPU_PCT_DEFAULT)
         self.pct_scale = tk.Scale(ldf, from_=CPU_PCT_MIN, to=100, orient="horizontal",
                                   variable=self.pct_var, command=self._on_pct,
-                                  showvalue=0, bg=ORANGE, fg=FG, troughcolor="#1c2534",
-                                  activebackground="#ffa733", highlightthickness=0,
+                                  showvalue=0, bg=ORANGE, fg=FG, troughcolor=BG,
+                                  activebackground=ORANGE_HOT, highlightthickness=0,
                                   bd=0, relief="flat", sliderrelief="flat",
                                   sliderlength=22, width=10)
         self.pct_scale.pack(side="left", fill="x", expand=True, padx=(0, 4))
-        self.pct_lbl = tk.Label(ldf, text="", fg=FG, bg=BG, width=22, anchor="w",
+        self.pct_lbl = tk.Label(ldf, text="", fg=FG, bg=CARD, width=22, anchor="w",
                                 font=("Segoe UI", 9, "bold"))
         self.pct_lbl.pack(side="left")
         self.full_var = tk.BooleanVar(value=False)
         self.full_chk = tk.Checkbutton(
-            form, variable=self.full_var, command=self._on_full,
+            inner, variable=self.full_var, command=self._on_full,
             text="Allow 100% CPU — full load makes this PC noticeably slower "
                  "(most people should leave this off)",
-            bg=BG, fg=MUTED, activebackground=BG, activeforeground=FG,
-            selectcolor=CARD, font=("Segoe UI", 8), anchor="w", highlightthickness=0)
-        self.full_chk.pack(anchor="w", padx=(116, 0))
+            bg=CARD, fg=MUTED, activebackground=CARD, activeforeground=FG,
+            selectcolor=BG, font=("Segoe UI", 8), anchor="w", highlightthickness=0)
+        self.full_chk.pack(anchor="w", padx=(118, 0))
         self._on_pct()
+        self._on_addr()
 
         btns = tk.Frame(self.root, bg=BG)
         btns.pack(fill="x", **pad)
         self.start_btn = tk.Button(btns, text="▶  Start Mining", command=self.start,
                                    bg=ORANGE, fg="#0b0e14", relief="flat",
-                                   font=("Segoe UI", 11, "bold"), activebackground="#ffa733",
+                                   font=("Segoe UI", 11, "bold"), activebackground=ORANGE_HOT,
                                    cursor="hand2", padx=16, pady=8)
         self.start_btn.pack(side="left")
         self.stop_btn = tk.Button(btns, text="■  Stop", command=self.stop,
                                   bg=CARD, fg=FG, relief="flat", state="disabled",
-                                  font=("Segoe UI", 11, "bold"), cursor="hand2",
-                                  padx=16, pady=8)
+                                  font=("Segoe UI", 11, "bold"), activebackground=BORDER,
+                                  cursor="hand2", padx=16, pady=8)
         self.stop_btn.pack(side="left", padx=8)
+
+        def hover(btn, normal, hot):
+            btn.bind("<Enter>", lambda _e: btn["state"] == "normal" and btn.config(bg=hot))
+            btn.bind("<Leave>", lambda _e: btn.config(bg=normal))
+        hover(self.start_btn, ORANGE, ORANGE_HOT)
+        hover(self.stop_btn, CARD, BORDER)
 
         stats = tk.Frame(self.root, bg=BG)
         stats.pack(fill="x", **pad)
@@ -598,12 +716,12 @@ class MinerApp:
         self.time_lbl.grid(row=0, column=2, sticky="e", pady=(0, 6))
 
         def stat(col, title):
-            f = tk.Frame(stats, bg=CARD)
+            f = tk.Frame(stats, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
             f.grid(row=1, column=col, sticky="nsew", padx=4)
             stats.grid_columnconfigure(col, weight=1)
-            tk.Label(f, text=title, fg=MUTED, bg=CARD, font=("Segoe UI", 8)).pack(pady=(8, 0))
-            v = tk.Label(f, text="—", fg=FG, bg=CARD, font=("Segoe UI", 14, "bold"))
-            v.pack(pady=(0, 8))
+            tk.Label(f, text=title, fg=MUTED, bg=CARD, font=("Segoe UI", 8)).pack(pady=(9, 0))
+            v = tk.Label(f, text="—", fg=FG, bg=CARD, font=("Segoe UI", 15, "bold"))
+            v.pack(pady=(0, 9))
             return v
 
         self.hr_lbl = stat(0, "HASHRATE")
@@ -620,10 +738,10 @@ class MinerApp:
         self.engine_lbl.pack(anchor="w", padx=18, pady=(2, 0))
 
         logf = tk.Frame(self.root, bg=BG)
-        logf.pack(fill="both", expand=True, padx=14, pady=(6, 14))
+        logf.pack(fill="both", expand=True, padx=14, pady=(6, 2))
         tk.Label(logf, text="Miner log", fg=MUTED, bg=BG,
                  font=("Segoe UI", 9)).pack(anchor="w")
-        body = tk.Frame(logf, bg=BG)
+        body = tk.Frame(logf, bg=BG, highlightbackground=BORDER, highlightthickness=1)
         body.pack(fill="both", expand=True)
         self.log = tk.Text(body, bg="#080b10", fg=MUTED, relief="flat", wrap="word",
                            font=("Consolas", 9), height=12, insertbackground=FG)
@@ -632,6 +750,28 @@ class MinerApp:
         sb.pack(side="right", fill="y")
         self.log.pack(side="left", fill="both", expand=True)
         self.log.configure(state="disabled")
+
+        foot = tk.Frame(self.root, bg=BG)
+        foot.pack(fill="x", padx=16, pady=(4, 10))
+        tk.Label(foot, text="SoloLuck Miner v%s · engine cpuminer-opt %s"
+                 % (APP_VERSION, ENGINE_VERSION), fg=MUTED, bg=BG,
+                 font=("Segoe UI", 8)).pack(side="left")
+        wn = tk.Label(foot, text="What's new ↗", fg=ORANGE, bg=BG, cursor="hand2",
+                      font=("Segoe UI", 8, "underline"))
+        wn.pack(side="right")
+        wn.bind("<Button-1>", lambda _e: webbrowser.open(CHANGELOG_URL))
+
+    def _on_addr(self):
+        a = self.addr_var.get().strip()
+        if not a:
+            self.addr_status.config(
+                text="A found block pays its whole reward to this address.", fg=MUTED)
+            return
+        ok, detail = validate_btc_address(a)
+        if ok:
+            self.addr_status.config(text="✓ Valid Bitcoin address — %s" % detail, fg=GREEN)
+        else:
+            self.addr_status.config(text="✗ Not a valid Bitcoin address — %s" % detail, fg=RED)
 
     def _open_stats(self, _event=None):
         if self._cur_addr:
@@ -718,8 +858,6 @@ class MinerApp:
                 c = json.load(f)
             self.addr_var.set(c.get("addr", ""))
             self.worker_var.set(c.get("worker", "pc"))
-            self.host_var.set(c.get("host", DEFAULT_HOST))
-            self.port_var.set(c.get("port", DEFAULT_PORT))
             if "cpu_pct" in c:
                 self.full_var.set(bool(c.get("full_cpu", False)))
                 self.pct_var.set(int(c["cpu_pct"]))
@@ -738,8 +876,6 @@ class MinerApp:
             with open(CFG_PATH, "w") as f:
                 json.dump({"addr": self.addr_var.get().strip(),
                            "worker": self.worker_var.get().strip(),
-                           "host": self.host_var.get().strip(),
-                           "port": self.port_var.get().strip(),
                            "cpu_pct": self.pct_var.get(),
                            "full_cpu": bool(self.full_var.get())}, f)
         except Exception:
@@ -769,18 +905,16 @@ class MinerApp:
             return
         addr = self.addr_var.get().strip()
         worker = re.sub(r"[^A-Za-z0-9_-]", "", self.worker_var.get().strip())
-        host = self.host_var.get().strip() or DEFAULT_HOST
-        port = self.port_var.get().strip() or DEFAULT_PORT
+        host, port = DEFAULT_HOST, DEFAULT_PORT   # pool endpoint is fixed
         self._on_pct()  # re-clamp in case the checkbox state changed
         threads = str(threads_for(self.pct_var.get(), self._ncpu))
 
-        if not ADDR_RE.match(addr):
+        ok, detail = validate_btc_address(addr)
+        if not ok:
             messagebox.showerror(APP_NAME,
-                "That doesn't look like a Bitcoin address.\n\nUse the address you want the "
-                "block reward paid to (e.g. bc1q…). In solo mode the address IS your login.")
-            return
-        if not port.isdigit() or not 1 <= int(port) <= 65535:
-            messagebox.showerror(APP_NAME, "Port must be a number between 1 and 65535 (e.g. 3335).")
+                "That is not a valid Bitcoin address (%s).\n\nUse the address you want the "
+                "block reward paid to (e.g. bc1q…). In solo mode the address IS your "
+                "login — a typo here would make a found block unclaimable." % detail)
             return
 
         miner = self._resolve_start_engine()
@@ -1037,7 +1171,7 @@ def _minetest(seconds, addr, threads):
     log = []
     def w(s):
         log.append(str(s))
-    if not ADDR_RE.match(addr or ""):
+    if not validate_btc_address(addr or "")[0]:
         w("bad or missing BTC address %r" % addr); w("RESULT: FAIL")
         open(out, "w").write("\n".join(log) + "\n"); return
     try:
