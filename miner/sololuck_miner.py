@@ -42,7 +42,7 @@ DEFAULT_HOST = "sololuck.io"
 DEFAULT_PORT = "3335"   # Nano tier — diff 1, tuned for CPUs so shares register fast
 ALGO = "sha256d"   # Bitcoin
 ENGINE_DIR_NAME = "SoloLuckMiner-engine"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 CHANGELOG_URL = "https://sololuck.io/changelog"
 # The pool endpoint is fixed: this is the SoloLuck app, and the Nano tier's
 # difficulty is what makes CPU shares register fast. (Generic pools have
@@ -904,8 +904,9 @@ class MinerApp:
         self.full_var = tk.BooleanVar(value=False)
         self.full_chk = tk.Checkbutton(
             inner, variable=self.full_var, command=self._on_full,
-            text="Allow 100% CPU — full load makes this PC noticeably slower "
-                 "(most people should leave this off)",
+            text="Use 100% of the CPU — full load for the best hashrate and lottery "
+                 "odds (also fine for a stress-test / burn-in). The PC will be slower "
+                 "for other work while mining.",
             bg=CARD, fg=MUTED, activebackground=CARD, activeforeground=FG,
             selectcolor=BG, font=("Segoe UI", 8), anchor="w", highlightthickness=0)
         self.full_chk.pack(anchor="w", padx=(118, 0))
@@ -980,6 +981,10 @@ class MinerApp:
         tk.Label(foot, text="SoloLuck Miner v%s · engine cpuminer-opt %s"
                  % (APP_VERSION, ENGINE_VERSION), fg=MUTED, bg=BG,
                  font=("Segoe UI", 8)).pack(side="left")
+        self.updchk_lbl = tk.Label(foot, text="Check for updates ↻", fg=ORANGE, bg=BG,
+                                   cursor="hand2", font=("Segoe UI", 8, "underline"))
+        self.updchk_lbl.pack(side="left", padx=(10, 0))
+        self.updchk_lbl.bind("<Button-1>", lambda _e: self._manual_check())
         wn = tk.Label(foot, text="What's new ↗", fg=ORANGE, bg=BG, cursor="hand2",
                       font=("Segoe UI", 8, "underline"))
         wn.pack(side="right")
@@ -1074,6 +1079,21 @@ class MinerApp:
         info = check_for_update()
         if info:
             self.q.put(("__UPDATE__", info))
+
+    def _manual_check(self):
+        """Footer 'Check for updates' link — reports both outcomes (the silent
+        startup check only surfaces a banner when something newer exists)."""
+        self.updchk_lbl.config(text="Checking…")
+        threading.Thread(target=self._manual_check_run, daemon=True).start()
+
+    def _manual_check_run(self):
+        try:
+            info = check_for_update()
+        except Exception:
+            info = None
+            self.q.put(("__NOUPD__", "err"))
+            return
+        self.q.put(("__UPDATE__", info) if info else ("__NOUPD__", "ok"))
 
     def _start_download(self):
         """Fetch + verify the update in the background (only meaningful frozen)."""
@@ -1215,7 +1235,10 @@ class MinerApp:
                 pct = max(CPU_PCT_MIN, min(100, pct))
                 self.full_var.set(pct > CPU_PCT_SOFT_MAX)
                 self.pct_var.set(pct)
-            self._on_pct()
+            # apply the checkbox logic so a saved "Allow 100%" actually forces the
+            # slider to 100 on load (older builds could restore box=on but slider=80,
+            # leaving the miner stuck at 80% even though full load was requested)
+            self._on_full()
         except Exception:
             pass
 
@@ -1254,8 +1277,13 @@ class MinerApp:
         addr = self.addr_var.get().strip()
         worker = re.sub(r"[^A-Za-z0-9_-]", "", self.worker_var.get().strip())
         host, port = DEFAULT_HOST, DEFAULT_PORT   # pool endpoint is fixed
-        self._on_pct()  # re-clamp in case the checkbox state changed
-        threads = str(threads_for(self.pct_var.get(), self._ncpu))
+        self._on_pct()  # sync the label with the current slider/checkbox state
+        # the checkbox is the source of truth for full load: if "Allow 100%" is
+        # ticked we mine at 100% no matter what the slider reads, otherwise the
+        # slider value capped at the soft max. This guarantees a checked box can
+        # never mine at 80% regardless of how the cfg/slider got there.
+        eff_pct = 100 if self.full_var.get() else min(self.pct_var.get(), CPU_PCT_SOFT_MAX)
+        threads = str(threads_for(eff_pct, self._ncpu))
 
         ok, detail = validate_btc_address(addr)
         if not ok:
@@ -1414,7 +1442,12 @@ class MinerApp:
             _verify_log("user-supplied engine %s unverified -> %s"
                         % (item[1], "user accepted" if self._user_engine_choice else "refused"))
             threading.Thread(target=self._init_engine, daemon=True).start()
+        elif kind == "__NOUPD__":
+            self.updchk_lbl.config(
+                text="Up to date ✓" if item[1] == "ok" else "Check failed — retry ↻")
+            self.root.after(4000, lambda: self.updchk_lbl.config(text="Check for updates ↻"))
         elif kind == "__UPDATE__":
+            self.updchk_lbl.config(text="Check for updates ↻")
             self._update_info = item[1]
             ver = item[1]["version"]
             self.update_bar.pack(fill="x", padx=14, pady=(0, 4),

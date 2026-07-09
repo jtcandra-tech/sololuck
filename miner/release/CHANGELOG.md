@@ -1,5 +1,20 @@
 # SoloLuck Miner — changelog
 
+## v1.7.0 — 2026-07-10
+- Fix: "Use 100% of the CPU" (full load) is now reliable. A configuration saved
+  by an earlier build could restore the box as checked but the slider at the 80%
+  cap, so the miner kept hashing at 80% even though 100% was selected. Loading a
+  saved full-load setting now always forces 100%, and the miner derives its
+  thread count from the checkbox at Start — so a checked box can never mine at
+  80% regardless of how the slider or saved config got there.
+- Full load reframed as a legitimate choice: best hashrate / lottery odds and
+  fine for a stress-test or burn-in — not just a warning. It still honestly
+  notes the PC will be slower for other work while mining.
+- Footer "Check for updates" link next to the version, so you can check for a
+  new release on demand (reports "Up to date ✓" when there is nothing newer).
+- Source published on GitHub for open review; the exact release is downloadable
+  from the site and from the GitHub release.
+
 ## v1.6.0 — 2026-07-10
 - Fix: ticking "Allow 100% CPU" now actually runs at 100%. Before, if the
   slider had snapped back to the 80% cap, checking the box left it at 80% — so
