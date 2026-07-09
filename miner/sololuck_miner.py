@@ -42,7 +42,13 @@ DEFAULT_HOST = "sololuck.io"
 DEFAULT_PORT = "3335"   # Nano tier — diff 1, tuned for CPUs so shares register fast
 ALGO = "sha256d"   # Bitcoin
 ENGINE_DIR_NAME = "SoloLuckMiner-engine"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
+# CPU load slider: gentle by default. Full load makes a PC noticeably slower,
+# so 100% is opt-in via an explicit checkbox; without it the slider tops out
+# at the soft max.
+CPU_PCT_MIN = 25
+CPU_PCT_SOFT_MAX = 80
+CPU_PCT_DEFAULT = 25
 # ── pinned mining engine ──────────────────────────────────────────────────────
 # Exact release, exact bytes. The app never fetches "latest", never falls back
 # to another URL or version, and never executes an engine file whose SHA-256
@@ -124,6 +130,16 @@ def explain_exit(code):
 def is_cpu_mismatch_exit(code):
     """True for the crash signatures a too-new build throws on an older CPU."""
     return code is not None and (code & 0xFFFFFFFF) in (0xC000001D, 0xC0000005)
+
+
+def threads_for(pct, ncpu):
+    """Miner thread count for a CPU-load percentage. Always at least 1."""
+    try:
+        pct = int(pct)
+    except (TypeError, ValueError):
+        pct = CPU_PCT_DEFAULT
+    pct = max(CPU_PCT_MIN, min(100, pct))
+    return max(1, int(round((ncpu or 1) * pct / 100.0)))
 
 # colours (brand-ish, works on the default tk theme)
 BG = "#0b0e14"
@@ -422,11 +438,14 @@ def _confirm_unverified_user_engine(path):
     explicit, informed yes. Headless: refuse (fail closed)."""
     if messagebox is None:
         return False
-    return bool(messagebox.askyesno(
-        APP_NAME,
-        "You placed your own engine next to the app:\n%s\n\n"
-        "It is NOT the SHA-256-verified cpuminer-opt %s build this app pins, so "
-        "SoloLuck cannot vouch for it.\n\nRun YOUR file anyway?" % (path, ENGINE_VERSION)))
+    try:
+        return bool(messagebox.askyesno(
+            APP_NAME,
+            "You placed your own engine next to the app:\n%s\n\n"
+            "It is NOT the SHA-256-verified cpuminer-opt %s build this app pins, so "
+            "SoloLuck cannot vouch for it.\n\nRun YOUR file anyway?" % (path, ENGINE_VERSION)))
+    except Exception:  # no display / dialog failure — fail closed
+        return False
 
 
 def ensure_engine(report=lambda s: None, confirm_unverified=None):
@@ -531,12 +550,31 @@ class MinerApp:
         self.worker_var, _ = row("Worker name", "pc")
         self.host_var, _ = row("Pool host", DEFAULT_HOST)
         self.port_var, _ = row("Port", DEFAULT_PORT)
-        self.threads_var, _ = row("CPU threads", "")
-        ncpu = os.cpu_count() or 0
-        hint = ("(blank = all %d cores; use fewer to keep the PC cool)" % ncpu) if ncpu \
-            else "(threads blank = auto / all cores)"
-        tk.Label(form, text=hint, fg=MUTED, bg=BG,
-                 font=("Segoe UI", 8)).pack(anchor="w", padx=(120, 0))
+        self._ncpu = os.cpu_count() or 1
+        ldf = tk.Frame(form, bg=BG)
+        ldf.pack(fill="x", pady=(8, 0))
+        tk.Label(ldf, text="CPU load", fg=MUTED, bg=BG, width=18, anchor="w",
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.pct_var = tk.IntVar(value=CPU_PCT_DEFAULT)
+        self.pct_scale = tk.Scale(ldf, from_=CPU_PCT_MIN, to=100, orient="horizontal",
+                                  variable=self.pct_var, command=self._on_pct,
+                                  showvalue=0, bg=ORANGE, fg=FG, troughcolor="#1c2534",
+                                  activebackground="#ffa733", highlightthickness=0,
+                                  bd=0, relief="flat", sliderrelief="flat",
+                                  sliderlength=22, width=10)
+        self.pct_scale.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.pct_lbl = tk.Label(ldf, text="", fg=FG, bg=BG, width=22, anchor="w",
+                                font=("Segoe UI", 9, "bold"))
+        self.pct_lbl.pack(side="left")
+        self.full_var = tk.BooleanVar(value=False)
+        self.full_chk = tk.Checkbutton(
+            form, variable=self.full_var, command=self._on_full,
+            text="Allow 100% CPU — full load makes this PC noticeably slower "
+                 "(most people should leave this off)",
+            bg=BG, fg=MUTED, activebackground=BG, activeforeground=FG,
+            selectcolor=CARD, font=("Segoe UI", 8), anchor="w", highlightthickness=0)
+        self.full_chk.pack(anchor="w", padx=(116, 0))
+        self._on_pct()
 
         btns = tk.Frame(self.root, bg=BG)
         btns.pack(fill="x", **pad)
@@ -598,6 +636,21 @@ class MinerApp:
     def _open_stats(self, _event=None):
         if self._cur_addr:
             webbrowser.open("https://sololuck.io/users/%s" % self._cur_addr)
+
+    # ---------- CPU load slider ----------
+    def _on_pct(self, _value=None):
+        pct = self.pct_var.get()
+        if not self.full_var.get() and pct > CPU_PCT_SOFT_MAX:
+            pct = CPU_PCT_SOFT_MAX
+            self.pct_var.set(pct)
+        t = threads_for(pct, self._ncpu)
+        self.pct_lbl.config(text="%d%% · %d of %d threads" % (pct, t, self._ncpu),
+                            fg=ORANGE if pct > CPU_PCT_SOFT_MAX else FG)
+
+    def _on_full(self):
+        if not self.full_var.get() and self.pct_var.get() > CPU_PCT_SOFT_MAX:
+            self.pct_var.set(CPU_PCT_SOFT_MAX)
+        self._on_pct()
 
     def _logln(self, text, color=None):
         self.log.configure(state="normal")
@@ -667,7 +720,16 @@ class MinerApp:
             self.worker_var.set(c.get("worker", "pc"))
             self.host_var.set(c.get("host", DEFAULT_HOST))
             self.port_var.set(c.get("port", DEFAULT_PORT))
-            self.threads_var.set(c.get("threads", ""))
+            if "cpu_pct" in c:
+                self.full_var.set(bool(c.get("full_cpu", False)))
+                self.pct_var.set(int(c["cpu_pct"]))
+            elif str(c.get("threads", "")).isdigit():
+                # pre-1.3.0 cfg stored a thread count — map it onto the slider
+                pct = int(round(int(c["threads"]) * 100.0 / self._ncpu))
+                pct = max(CPU_PCT_MIN, min(100, pct))
+                self.full_var.set(pct > CPU_PCT_SOFT_MAX)
+                self.pct_var.set(pct)
+            self._on_pct()
         except Exception:
             pass
 
@@ -678,7 +740,8 @@ class MinerApp:
                            "worker": self.worker_var.get().strip(),
                            "host": self.host_var.get().strip(),
                            "port": self.port_var.get().strip(),
-                           "threads": self.threads_var.get().strip()}, f)
+                           "cpu_pct": self.pct_var.get(),
+                           "full_cpu": bool(self.full_var.get())}, f)
         except Exception:
             pass
 
@@ -708,7 +771,8 @@ class MinerApp:
         worker = re.sub(r"[^A-Za-z0-9_-]", "", self.worker_var.get().strip())
         host = self.host_var.get().strip() or DEFAULT_HOST
         port = self.port_var.get().strip() or DEFAULT_PORT
-        threads = self.threads_var.get().strip()
+        self._on_pct()  # re-clamp in case the checkbox state changed
+        threads = str(threads_for(self.pct_var.get(), self._ncpu))
 
         if not ADDR_RE.match(addr):
             messagebox.showerror(APP_NAME,

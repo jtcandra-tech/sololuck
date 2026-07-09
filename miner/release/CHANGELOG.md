@@ -1,5 +1,16 @@
 # SoloLuck Miner — changelog
 
+## v1.3.0 — 2026-07-10
+- CPU load is now a slider, not a thread count. It starts gentle at 25% of
+  your cores and tops out at 80%; the thread math is done for you
+  ("25% · 3 of 12 threads").
+- Mining at 100% CPU is opt-in via an explicit checkbox with an honest
+  warning: full load makes the PC noticeably slower. Most people should mine
+  throttled — the lottery odds are the same, per-hash, either way.
+- Old configs with a saved thread count migrate onto the slider automatically.
+- Fail-closed hardening: if the "run your own engine?" dialog cannot be shown
+  (headless/display failure), the unverified engine is refused.
+
 ## v1.2.0 — 2026-07-10
 - SECURITY FIX: the GUI now enforces the pinned-engine rules end-to-end. In
   v1.1.0 only the headless test paths verified engines; the window itself would

@@ -94,6 +94,29 @@ class TestPreferredBuilds(unittest.TestCase):
         self.assertEqual(got[0], "cpuminer-avx2-sha-vaes.exe")
 
 
+class TestThreadsFor(unittest.TestCase):
+    def test_quarter_load_defaults(self):
+        self.assertEqual(m.threads_for(25, 12), 3)
+        self.assertEqual(m.threads_for(25, 8), 2)
+        self.assertEqual(m.threads_for(25, 4), 1)
+
+    def test_never_zero_threads(self):
+        for ncpu in (1, 2, 3):
+            self.assertEqual(m.threads_for(25, ncpu), 1)
+        self.assertEqual(m.threads_for(25, None), 1)
+
+    def test_full_load_uses_all_cores(self):
+        self.assertEqual(m.threads_for(100, 12), 12)
+
+    def test_soft_max(self):
+        self.assertEqual(m.threads_for(80, 12), 10)
+
+    def test_clamps_and_garbage(self):
+        self.assertEqual(m.threads_for(5, 12), m.threads_for(m.CPU_PCT_MIN, 12))
+        self.assertEqual(m.threads_for(250, 12), 12)
+        self.assertEqual(m.threads_for("junk", 12), m.threads_for(m.CPU_PCT_DEFAULT, 12))
+
+
 class TestMinetestGuard(unittest.TestCase):
     def test_rejects_missing_or_bad_address(self):
         tmp = tempfile.mkdtemp(prefix="slm-mt-")
