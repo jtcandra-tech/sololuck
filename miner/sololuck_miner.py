@@ -1228,7 +1228,7 @@ class MinerApp:
             messagebox.showinfo("Verify build",
                 "You're running from source, so there's no released .exe to verify.\n\n"
                 "Download the signed release from sololuck.io/setup, or read the source "
-                "on GitHub: github.com/jtcandra-tech/sololuck")
+                "on GitHub: github.com/sololuckio/sololuck")
             return
         if mode == "error":
             messagebox.showwarning("Verify build", "Couldn't verify this file:\n%s" % res.get("err"))
@@ -1251,7 +1251,7 @@ class MinerApp:
                 "Your build: v%s   (site's current release: v%s)\n\n"
                 "Compare the SHA-256 above against the published checksum for v%s at:\n"
                 "  sololuck.io/SHA256SUMS.txt\n"
-                "  or the GitHub release: github.com/jtcandra-tech/sololuck/releases"
+                "  or the GitHub release: github.com/sololuckio/sololuck/releases"
                 % (av, lv or "?", av))
 
     def _start_download(self):
