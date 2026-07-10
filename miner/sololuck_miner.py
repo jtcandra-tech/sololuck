@@ -43,7 +43,7 @@ DEFAULT_HOST = "sololuck.io"
 DEFAULT_PORT = "3335"   # Nano tier — diff 1, tuned for CPUs so shares register fast
 ALGO = "sha256d"   # Bitcoin
 ENGINE_DIR_NAME = "SoloLuckMiner-engine"
-APP_VERSION = "1.9.2"
+APP_VERSION = "1.10.0"
 CHANGELOG_URL = "https://sololuck.io/changelog"
 # The pool endpoint is fixed: this is the SoloLuck app, and the Nano tier's
 # difficulty is what makes CPU shares register fast. (Generic pools have
@@ -1078,6 +1078,10 @@ class MinerApp:
                                    cursor="hand2", font=("Segoe UI", 8, "underline"))
         self.updchk_lbl.pack(side="left", padx=(10, 0))
         self.updchk_lbl.bind("<Button-1>", lambda _e: self._manual_check())
+        self.verify_lbl = tk.Label(foot, text="Verify build ✓", fg=ORANGE, bg=BG,
+                                   cursor="hand2", font=("Segoe UI", 8, "underline"))
+        self.verify_lbl.pack(side="left", padx=(10, 0))
+        self.verify_lbl.bind("<Button-1>", lambda _e: self._verify_build())
         wn = tk.Label(foot, text="What's new ↗", fg=ORANGE, bg=BG, cursor="hand2",
                       font=("Segoe UI", 8, "underline"))
         wn.pack(side="right")
@@ -1187,6 +1191,68 @@ class MinerApp:
             self.q.put(("__NOUPD__", "err"))
             return
         self.q.put(("__UPDATE__", info) if info else ("__NOUPD__", "ok"))
+
+    def _verify_build(self):
+        """Footer 'Verify build' link — SHA-256s the running .exe and checks it
+        against the checksum published on sololuck.io (fail-loud on mismatch)."""
+        self.verify_lbl.config(text="Verifying…")
+        threading.Thread(target=self._verify_run, daemon=True).start()
+
+    def _verify_run(self):
+        try:
+            if not getattr(sys, "frozen", False):
+                self.q.put(("__VERIFY__", {"mode": "source"}))
+                return
+            path = sys.executable
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            res = {"mode": "exe", "path": path, "sha": h.hexdigest(),
+                   "app_version": APP_VERSION}
+            try:
+                latest = _http_get(LATEST_URL, want_json=True, timeout=15)
+            except Exception:
+                latest = None
+            if isinstance(latest, dict):
+                res["latest_version"] = latest.get("version")
+                res["latest_sha"] = (latest.get("sha256") or "").lower()
+            self.q.put(("__VERIFY__", res))
+        except Exception as e:
+            self.q.put(("__VERIFY__", {"mode": "error", "err": str(e)}))
+
+    def _on_verify_result(self, res):
+        self.verify_lbl.config(text="Verify build ✓")
+        mode = res.get("mode")
+        if mode == "source":
+            messagebox.showinfo("Verify build",
+                "You're running from source, so there's no released .exe to verify.\n\n"
+                "Download the signed release from sololuck.io/setup, or read the source "
+                "on GitHub: github.com/jtcandra-tech/sololuck")
+            return
+        if mode == "error":
+            messagebox.showwarning("Verify build", "Couldn't verify this file:\n%s" % res.get("err"))
+            return
+        sha, av = res["sha"], res["app_version"]
+        lv, ls = res.get("latest_version"), res.get("latest_sha")
+        head = "This file:\n  %s\n\nSHA-256:\n  %s\n\n" % (res["path"], sha)
+        if lv and av == lv and ls:
+            if sha == ls:
+                messagebox.showinfo("Verify build ✓", head +
+                    "✓ MATCH — this is the authentic SoloLuck Miner v%s.\n"
+                    "Its checksum matches sololuck.io exactly." % av)
+            else:
+                messagebox.showerror("Verify build ✗", head +
+                    "✗ MISMATCH — this file does NOT match the published v%s checksum!\n"
+                    "  published: %s\n\n"
+                    "Do not trust this file. Re-download from sololuck.io/setup." % (av, ls))
+        else:
+            messagebox.showinfo("Verify build", head +
+                "Your build: v%s   (site's current release: v%s)\n\n"
+                "Compare the SHA-256 above against the published checksum for v%s at:\n"
+                "  sololuck.io/SHA256SUMS.txt\n"
+                "  or the GitHub release: github.com/jtcandra-tech/sololuck/releases"
+                % (av, lv or "?", av))
 
     def _start_download(self):
         """Fetch + verify the update in the background (only meaningful frozen)."""
@@ -1580,6 +1646,8 @@ class MinerApp:
             threading.Thread(target=self._init_engine, daemon=True).start()
         elif kind == "__SHIELD__":
             self._on_shield_result(item[1])
+        elif kind == "__VERIFY__":
+            self._on_verify_result(item[1])
         elif kind == "__NOUPD__":
             self.updchk_lbl.config(
                 text="Up to date ✓" if item[1] == "ok" else "Check failed — retry ↻")

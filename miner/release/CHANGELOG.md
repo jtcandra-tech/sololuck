@@ -1,5 +1,16 @@
 # SoloLuck Miner — changelog
 
+## v1.10.0 — 2026-07-10
+- Verify it's genuine, three ways. New **"Verify build ✓"** link in the app footer:
+  it SHA-256s the running .exe and checks it against the checksum published on
+  sololuck.io — a clear ✓ match, or a loud ✗ if the file was tampered with.
+- Releases are now **GPG-signed**. Every download has a detached `.asc` signature;
+  the SoloLuck public key is on /setup and in the GitHub repo, so you can prove a
+  file really came from us (not a swapped mirror), not just that it's intact.
+- **VirusTotal** transparency: /setup links a scan so you can see for yourself that
+  the only flags are the well-known open-source cpuminer "coinminer/PUA"
+  false-positive — not a trojan. CPU miners always trip this; nothing is hidden.
+
 ## v1.9.2 — 2026-07-10
 - Maintenance rebuild — no functional change. Same behavior as v1.9.1 (runs
   without turning off antivirus; shields its engine folder before download).
