@@ -43,7 +43,7 @@ DEFAULT_HOST = "sololuck.io"
 DEFAULT_PORT = "3335"   # Nano tier — diff 1, tuned for CPUs so shares register fast
 ALGO = "sha256d"   # Bitcoin
 ENGINE_DIR_NAME = "SoloLuckMiner-engine"
-APP_VERSION = "1.9.1"
+APP_VERSION = "1.9.2"
 CHANGELOG_URL = "https://sololuck.io/changelog"
 # The pool endpoint is fixed: this is the SoloLuck app, and the Nano tier's
 # difficulty is what makes CPU shares register fast. (Generic pools have

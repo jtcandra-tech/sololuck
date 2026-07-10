@@ -1,9 +1,9 @@
 {
   "app": "SoloLuck Miner",
-  "version": "1.9.1",
+  "version": "1.9.2",
   "release_date": "2026-07-10",
-  "source_zip": "SoloLuckMiner-v1.9.1-src.zip",
-  "source_zip_sha256": "c16926c83bbd68bdfd0e694f7f36aeab87835ec637c0487f886e85e1c08213a8",
+  "source_zip": "SoloLuckMiner-v1.9.2-src.zip",
+  "source_zip_sha256": "b890457301b2211670b4631dd7be93ea7db98b282ebd40b293b2d42a77ea8853",
   "license": "see README.md; bundled engine cpuminer-opt is GPLv2",
   "engine": {
     "name": "cpuminer-opt",
@@ -13,10 +13,10 @@
     "archive_sha256": "caf59deb12831e40475c5245a76bf42f9ba2ff620065be5386b80ec55c998e9c"
   },
   "exe": {
-    "file": "SoloLuckMiner-v1.9.1.exe",
-    "sha256": "b3698bcb05c55049ad4d9f27ff1acf3dc83ed2ec12d3a950afa7a76a1ab5e4ac",
-    "size": 11125666,
-    "built_on": "cg001 (Windows 11, Python 3.12.7, PyInstaller 6.21.0)",
+    "file": "SoloLuckMiner-v1.9.2.exe",
+    "sha256": "7c03b0770a945241fff277fa4315affc48e07ba5df5ac9b0d827a881e4dcf171",
+    "size": 11124532,
+    "built_on": "skyline (Windows, AMD Ryzen 9800X3D, Python 3.12.7, PyInstaller 6.21.0)",
     "status": "STABLE",
     "channel": "stable"
   }

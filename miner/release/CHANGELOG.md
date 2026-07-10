@@ -1,5 +1,9 @@
 # SoloLuck Miner — changelog
 
+## v1.9.2 — 2026-07-10
+- Maintenance rebuild — no functional change. Same behavior as v1.9.1 (runs
+  without turning off antivirus; shields its engine folder before download).
+
 ## v1.9.1 — 2026-07-10
 - Maintenance rebuild of v1.9.0 — no functional change. Carries the full v1.9
   antivirus improvement: the app shields its own engine folder from Windows
