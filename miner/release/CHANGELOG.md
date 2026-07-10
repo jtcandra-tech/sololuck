@@ -1,5 +1,11 @@
 # SoloLuck Miner — changelog
 
+## v1.9.1 — 2026-07-10
+- Maintenance rebuild of v1.9.0 — no functional change. Carries the full v1.9
+  antivirus improvement: the app shields its own engine folder from Windows
+  Defender *before* downloading the engine, so the fast build is never
+  quarantined and you never need to turn real-time protection off.
+
 ## v1.9.0 — 2026-07-10
 - Runs without turning off antivirus. You do NOT need to disable Windows
   real-time protection. On first run (before the engine is ever written to disk)
