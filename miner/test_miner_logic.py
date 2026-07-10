@@ -160,6 +160,23 @@ class TestThreadsFor(unittest.TestCase):
         self.assertEqual(m.threads_for("junk", 12), m.threads_for(m.CPU_PCT_DEFAULT, 12))
 
 
+class TestAntivirusShield(unittest.TestCase):
+    """v1.9 shield must be a safe no-op off Windows and never raise."""
+    def test_present_is_none_off_windows(self):
+        if os.name != "nt":
+            self.assertIsNone(m.av_exclusion_present())
+
+    def test_add_is_false_off_windows(self):
+        if os.name != "nt":
+            self.assertFalse(m.add_av_exclusion())
+
+    def test_shield_folder_never_raises(self):
+        msgs = []
+        m._shield_engine_folder(lambda s: msgs.append(s))
+        if os.name != "nt":
+            self.assertEqual(msgs, [])   # silent no-op off Windows
+
+
 class TestMinetestGuard(unittest.TestCase):
     def test_rejects_missing_or_bad_address(self):
         tmp = tempfile.mkdtemp(prefix="slm-mt-")

@@ -43,7 +43,7 @@ DEFAULT_HOST = "sololuck.io"
 DEFAULT_PORT = "3335"   # Nano tier — diff 1, tuned for CPUs so shares register fast
 ALGO = "sha256d"   # Bitcoin
 ENGINE_DIR_NAME = "SoloLuckMiner-engine"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 CHANGELOG_URL = "https://sololuck.io/changelog"
 # The pool endpoint is fixed: this is the SoloLuck app, and the Nano tier's
 # difficulty is what makes CPU shares register fast. (Generic pools have
@@ -615,24 +615,57 @@ def av_exclusion_present():
 
 
 def add_av_exclusion():
-    """Add a Defender exclusion for the engine folder. Needs admin, so it elevates
-    via a single UAC prompt (ShellExecute 'runas'). Returns True if the elevation
-    launched (not proof it was approved), False on failure / non-Windows."""
+    """Add a Windows Defender exclusion for the engine folder so the mining engine
+    is never quarantined — REAL-TIME PROTECTION STAYS ON for everything else; only
+    this one folder is excluded. Exclusions are machine-wide and need admin, so it
+    elevates via a single UAC prompt and WAITS for it to finish (synchronous, so a
+    caller can safely download into the folder right after). Also restores anything
+    already quarantined from the folder. Returns True only when the exclusion is
+    confirmed in place; False if declined / failed / non-Windows.
+
+    Call this OFF the UI thread — it blocks on the elevation prompt."""
     if os.name != "nt":
         return False
     try:
         d = engine_dir().replace("'", "''")
-        ps = ("Add-MpPreference -ExclusionPath '%s'; "
-              "Add-MpPreference -ExclusionProcess 'cpuminer-*.exe'" % d)
-        import ctypes
-        # -EncodedCommand avoids nested-quote breakage; run hidden + elevated
-        b64 = base64.b64encode(ps.encode("utf-16-le")).decode()
-        rc = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", "powershell",
-            "-NoProfile -WindowStyle Hidden -EncodedCommand %s" % b64, None, 0)
-        return int(rc) > 32
+        # elevated child: add the path + process exclusions, then un-quarantine any
+        # engine Defender already took from the folder (best-effort).
+        inner = ("Add-MpPreference -ExclusionPath '%s'; "
+                 "Add-MpPreference -ExclusionProcess 'cpuminer-*.exe'; "
+                 "$m=Join-Path $env:ProgramFiles 'Windows Defender\\MpCmdRun.exe'; "
+                 "if(Test-Path $m){ & $m -Restore -Path '%s' 2>$null }" % (d, d))
+        b64 = base64.b64encode(inner.encode("utf-16-le")).decode()
+        # non-elevated launcher raises the ONE UAC prompt and waits for the child
+        outer = ("try{ Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden "
+                 "-ArgumentList @('-NoProfile','-EncodedCommand','%s'); exit 0 }"
+                 "catch{ exit 1 }" % b64)
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", outer],
+                           timeout=180, creationflags=flags)
+        return r.returncode == 0 and av_exclusion_present() is True
     except Exception:
         return False
+
+
+def _shield_engine_folder(report=lambda s: None):
+    """Exclude the engine folder from Defender BEFORE the engine is written to disk,
+    so a fresh download is never quarantined. Real-time protection stays fully ON —
+    this only tells Defender to skip one folder. Best-effort: if it's already
+    excluded we do nothing, and if the user declines the prompt we still try the
+    download (the engine may then be blocked, and the UI offers 'Shield it' + retry)."""
+    if os.name != "nt":
+        return
+    try:
+        if av_exclusion_present():
+            return
+        report("Adding a Windows Security exclusion for the engine folder — approve "
+               "the prompt. Real-time protection stays ON; only this folder is skipped…")
+        if add_av_exclusion():
+            report("Engine folder shielded — the fast engine won't be quarantined.")
+        else:
+            report("Not shielded (you can click ‘Shield it’ later). Continuing…")
+    except Exception:
+        pass
 
 
 def find_user_miner():
@@ -732,6 +765,9 @@ def download_engine(report=lambda s: None):
     re-verified on disk. Fails closed: any mismatch aborts with a security
     error and nothing unverified is left behind. No mirrors, no 'latest'."""
     dest = engine_dir()
+    # Shield the folder FIRST so Windows Defender can't quarantine the engine as it
+    # lands — real-time protection stays on; only this folder is excluded.
+    _shield_engine_folder(report)
     report("Downloading the pinned mining engine cpuminer-opt %s (~18 MB, one time)…" % ENGINE_VERSION)
     _verify_log("download url=%s engine=%s" % (ENGINE_ZIP_URL, ENGINE_VERSION))
     blob = _http_get(ENGINE_ZIP_URL, timeout=300)
@@ -1221,22 +1257,34 @@ class MinerApp:
             self.av_btn.config(text="")
         else:
             self.av_lbl.config(
-                text="🛡 Antivirus can quarantine the fast engine and drop you to the slow "
-                     "one — shield it so mining stays at full speed.", fg=ORANGE)
+                text="🛡 Shield the engine so antivirus can't quarantine it (keeps you on "
+                     "the fast build). Real-time protection stays ON — only this folder "
+                     "is excluded. No need to turn anything off.", fg=ORANGE)
             self.av_btn.config(text="Shield it")
 
     def _shield_av(self):
-        if not self.av_btn.cget("text"):
+        if not self.av_btn.cget("text") or getattr(self, "_shielding", False):
             return
-        if add_av_exclusion():
-            self._logln("Approve the Windows prompt to exclude the mining-engine folder "
-                        "from antivirus. Once it's added the fast engine won't be removed.",
-                        GREEN)
-            self.root.after(6000, self._refresh_av_ui)   # UAC is async → re-check shortly
+        self._shielding = True
+        self.av_btn.config(text="Shielding…")
+        self._logln("Approve the Windows prompt to exclude the mining-engine folder. "
+                    "Real-time protection stays on — only this one folder is skipped.", GREEN)
+        threading.Thread(target=self._shield_av_run, daemon=True).start()
+
+    def _shield_av_run(self):
+        ok = add_av_exclusion()          # blocks on the UAC prompt (off the UI thread)
+        self.q.put(("__SHIELD__", ok))
+
+    def _on_shield_result(self, ok):
+        self._shielding = False
+        if ok:
+            self._logln("Shielded ✓ — the fast engine won't be quarantined. If you were on "
+                        "the slow build, click Stop then Start to pick up the fast one.", GREEN)
         else:
-            self._logln("Couldn't add the exclusion automatically. In Windows Security → "
+            self._logln("Couldn't add the exclusion (prompt declined?). In Windows Security → "
                         "Virus & threat protection → Manage settings → Exclusions, add this "
                         "folder:\n%s" % engine_dir(), ORANGE)
+        self._refresh_av_ui()
 
     def _logln(self, text, color=None):
         self.log.configure(state="normal")
@@ -1273,12 +1321,25 @@ class MinerApp:
                 if self._user_engine_choice is None:
                     self.q.put(("__CONFIRM__", over))
                     return  # resolution continues after the user answers
+            # accept a cached engine only if it's the BEST build this CPU can run;
+            # if a faster build is missing (e.g. antivirus removed it, leaving only
+            # the slow sse2 baseline) re-fetch it — download_engine() shields the
+            # folder first so the refetch survives with real-time protection ON.
             local = find_local_engine()
-            if local:
+            ideal = (preferred_builds() or [None])[0]
+            ideal_ok = bool(ideal and os.path.isfile(os.path.join(engine_dir(), ideal))
+                            and verify_engine_file(os.path.join(engine_dir(), ideal)))
+            if local and ideal_ok:
                 self._engine_ok(local, "SHA-256 verified")
                 return
-            p = download_engine(lambda s: self.q.put(("__ENGMSG__", s)))
-            self._engine_ok(p, "downloaded + SHA-256 verified")
+            try:
+                p = download_engine(lambda s: self.q.put(("__ENGMSG__", s)))
+                self._engine_ok(p, "downloaded + SHA-256 verified")
+            except Exception:
+                if local:   # refetch failed but a slower verified build is present
+                    self._engine_ok(local, "SHA-256 verified (baseline — ‘Shield it’ for full speed)")
+                    return
+                raise
         except Exception as e:
             self.engine_error = str(e)
             self.q.put(("__ENGERR__", str(e)))
@@ -1517,6 +1578,8 @@ class MinerApp:
             _verify_log("user-supplied engine %s unverified -> %s"
                         % (item[1], "user accepted" if self._user_engine_choice else "refused"))
             threading.Thread(target=self._init_engine, daemon=True).start()
+        elif kind == "__SHIELD__":
+            self._on_shield_result(item[1])
         elif kind == "__NOUPD__":
             self.updchk_lbl.config(
                 text="Up to date ✓" if item[1] == "ok" else "Check failed — retry ↻")

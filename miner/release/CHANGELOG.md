@@ -1,5 +1,18 @@
 # SoloLuck Miner — changelog
 
+## v1.9.0 — 2026-07-10
+- Runs without turning off antivirus. You do NOT need to disable Windows
+  real-time protection. On first run (before the engine is ever written to disk)
+  the app adds a Windows Defender exclusion for just its engine folder — a single
+  admin prompt — so the fast mining engine is never quarantined. Real-time
+  protection stays fully ON for everything else; only that one folder is skipped.
+- The exclusion is now applied and confirmed *before* the download, so the engine
+  can't be removed mid-download. If antivirus had already dropped you to the slow
+  SSE2 build, the app now re-fetches the fast engine into the shielded folder
+  automatically instead of staying slow.
+- Clearer wording throughout that shielding excludes one folder, not your whole
+  PC — there is never a reason to turn real-time protection off.
+
 ## v1.8.0 — 2026-07-10
 - CPU load is now hard-capped at 90% (was 100%). The last few threads add very
   little hashrate for a lot of extra heat, and full load can make the PC
