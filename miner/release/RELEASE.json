@@ -1,9 +1,9 @@
 {
   "app": "SoloLuck Miner",
-  "version": "1.10.0",
+  "version": "1.10.1",
   "release_date": "2026-07-10",
-  "source_zip": "SoloLuckMiner-v1.10.0-src.zip",
-  "source_zip_sha256": "9fabee433e4e2d44d7008b796cac148baa71c0a296ca855f3a6e6ead7d72ed7a",
+  "source_zip": "SoloLuckMiner-v1.10.1-src.zip",
+  "source_zip_sha256": "78241ad965761873feab5cec2e7665b78f741c0dd2e8cb8c6ebeca0735fc92ce",
   "license": "see README.md; bundled engine cpuminer-opt is GPLv2",
   "signing": {
     "method": "GPG (detached .asc per file)",
@@ -18,9 +18,9 @@
     "archive_sha256": "caf59deb12831e40475c5245a76bf42f9ba2ff620065be5386b80ec55c998e9c"
   },
   "exe": {
-    "file": "SoloLuckMiner-v1.10.0.exe",
-    "sha256": "da2a11096a4783275c025cf53554c9450aa591c0ac150de8f91d22d256af14c6",
-    "size": 11126392,
+    "file": "SoloLuckMiner-v1.10.1.exe",
+    "sha256": "e201387dc8135f3a2d202bf0449f99ae8ac160986d140c76b4bf11678370c801",
+    "size": 11128251,
     "built_on": "skyline (Windows, AMD Ryzen 9800X3D, Python 3.12.7, PyInstaller 6.21.0)",
     "status": "STABLE",
     "channel": "stable"

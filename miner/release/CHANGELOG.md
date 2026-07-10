@@ -1,5 +1,9 @@
 # SoloLuck Miner — changelog
 
+## v1.10.1 — 2026-07-10
+- Maintenance: the in-app GitHub links now point to the project's new home,
+  github.com/sololuckio/sololuck. No functional change.
+
 ## v1.10.0 — 2026-07-10
 - Verify it's genuine, three ways. New **"Verify build ✓"** link in the app footer:
   it SHA-256s the running .exe and checks it against the checksum published on
