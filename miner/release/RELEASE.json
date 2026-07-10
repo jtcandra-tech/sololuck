@@ -17,7 +17,7 @@
     "sha256": "b59737ed900081851e2e1b9b39b48f7632aa5ac817ceed27315bec3e2b34626f",
     "size": 11125898,
     "built_on": "cg001 (Windows 11, Python 3.12.7, PyInstaller 6.21.0)",
-    "status": "RELEASED",
+    "status": "STABLE",
     "channel": "stable"
   }
 }
